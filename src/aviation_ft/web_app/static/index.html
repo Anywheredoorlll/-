@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>民航智能研究工作台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark"><i></i><i></i><i></i></span><strong>智能研究工作台</strong></div>
+      <nav id="main-nav">
+        <button class="nav-item active" data-view="overview"><span>▦</span>总览</button>
+        <button class="nav-item" data-view="upload"><span>▱</span>数据中心</button>
+        <button class="nav-item" data-view="evidence"><span>◇</span>原文证据</button>
+        <button class="nav-item" data-view="review"><span>☑</span>问答审核</button>
+        <button class="nav-item" data-view="export"><span>▤</span>结果交付</button>
+        <button class="nav-item" data-view="provider"><span>⚙</span>模型 API</button>
+      </nav>
+      <div class="sidebar-jobs">
+        <div class="side-label">当前任务</div>
+        <select id="job-select"></select>
+        <button id="new-job-button" class="ghost-button">＋ 新建任务</button>
+        <button id="delete-job-button" class="ghost-button danger-ghost">删除当前任务</button>
+      </div>
+      <div class="storage-card">
+        <span>构建环境</span>
+        <strong id="provider-mode-label">本地模型模式</strong>
+        <div><i></i><small id="provider-mode-detail">仅监听 127.0.0.1</small></div>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div class="search"><span>⌕</span><input id="global-search" placeholder="搜索任务、文档或页面…"><kbd>⌘ K</kbd></div>
+        <div class="top-actions">
+          <span class="env" id="provider-env"><i></i>本地模型</span>
+          <button class="icon-button" title="刷新" id="refresh-button">↻</button>
+          <div class="user-avatar">研</div>
+          <div class="user-copy"><strong>研究员</strong><small>数据构建</small></div>
+        </div>
+      </header>
+      <main id="content" class="content"></main>
+    </section>
+  </div>
+
+  <dialog id="job-dialog">
+    <form method="dialog" id="job-form">
+      <div class="dialog-head"><strong>新建数据集任务</strong><button value="cancel">×</button></div>
+      <label>任务名称<input id="job-label" maxlength="100" placeholder="例如：飞行标准资料集" required></label>
+      <div class="dialog-actions"><button value="cancel" class="secondary">取消</button><button value="default" id="create-job" class="primary">创建任务</button></div>
+    </form>
+  </dialog>
+  <dialog id="delete-job-dialog">
+    <form method="dialog" id="delete-job-form">
+      <div class="dialog-head"><strong>永久删除当前任务</strong><button value="cancel">×</button></div>
+      <p class="dialog-warning">任务目录、上传文档、证据、候选数据和该任务的 API Key 都会被永久删除，此操作不可撤销。</p>
+      <div class="delete-job-target">任务 ID：<code id="delete-job-id"></code></div>
+      <label>输入完整任务 ID 确认<input id="delete-job-confirmation" autocomplete="off" placeholder="粘贴上方完整任务 ID" required></label>
+      <div class="dialog-actions"><button value="cancel" class="secondary">取消</button><button type="button" id="confirm-delete-job" class="danger">永久删除任务</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js?v=20260918-downloads"></script>
+</body>
+</html>

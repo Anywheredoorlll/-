@@ -1,0 +1,10 @@
+{
+  "generator_model_dir": "models/generator",
+  "max_file_mb": 200,
+  "max_job_mb": 600,
+  "min_free_gb_after_upload": 5,
+  "completed_job_retention_days": 7,
+  "ocr_languages": "chi_sim+eng",
+  "ocr_dpi": 200,
+  "ocr_tessdata": "models/ocr/tessdata"
+}
