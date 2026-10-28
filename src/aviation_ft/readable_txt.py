@@ -195,7 +195,9 @@ def document_blocks(units, layout):
             continue
         clause = CLAUSE.match(text)
         # Do not group across missing PDF pages or unrelated unnumbered paragraphs.
-        if clause or (current and u["pdf_page"] > current["end_pdf_page"] + 1):
+        if clause or (current and (u["pdf_page"] > current["end_pdf_page"] + 1
+                                  or (u.get("parse_version") == "parse-v2"
+                                      and u["pdf_page"] > current["end_pdf_page"]))):
             flush()
         if current and not section and not current["clause"]:
             flush()
@@ -203,7 +205,9 @@ def document_blocks(units, layout):
             current = {"doc_id": u["doc_id"], "clause": clause[1] if clause else "",
                        "section": list(section), "pdf_page": u["pdf_page"],
                        "end_pdf_page": u["end_pdf_page"], "parts": [],
-                       "source_locations": [], "tables": [], "warnings": []}
+                       "source_locations": [], "source_fragments": [],
+                       "source_semantic_ids": [], "raw_source_parts": [],
+                       "tables": [], "warnings": []}
         if u["kind"] == "table":
             text, tables, warnings = layout.render_table(u)
             current["tables"].extend(tables)
@@ -217,6 +221,14 @@ def document_blocks(units, layout):
         # Keep explanations, list items and captions on their own lines.
         current["parts"].append(text)
         current["source_locations"].extend(u["source_locations"])
+        offset = len(current["source_fragments"])
+        current["source_fragments"].extend(
+            {**fragment, "order": offset + position}
+            for position, fragment in enumerate(u.get("source_fragments", [])))
+        current["source_semantic_ids"].append(u["semantic_id"])
+        current["raw_source_parts"].append(u["raw_text"])
+        if (u.get("cross_page_merge") or {}).get("decision") == "proposed":
+            current["warnings"].append("跨页合并仅为未确认建议，整理版保持分开")
         current["end_pdf_page"] = max(current["end_pdf_page"], u["end_pdf_page"])
     flush()
     return events, excluded
@@ -228,6 +240,8 @@ def build(job_id):
     if not pages:
         raise ValueError("请先解析 PDF，再生成整体 TXT")
     meta = core.load_job(job_id)
+    quality_issues = core.read_jsonl(root / "parsed/issues.jsonl")
+    parse_version = sorted({page.get("parse_version", "legacy") for page in pages})
     sections, records, exclusions, warnings = [], [], [], []
     merged_cross_page = 0
     with ExitStack() as stack:
@@ -252,10 +266,10 @@ def build(job_id):
                                        "reason": "封底出版信息"})
                     continue
                 document_pages.append(page)
-            units = core.semantic_blocks_for_document(document_pages)
+            units = core.semantic_blocks_for_document(document_pages, core.confirmed_merge_pairs(job_id))
             merged_cross_page += sum(len({loc["pdf_page"] for loc in u["source_locations"]}) - 1 for u in units)
             events, excluded = document_blocks(units, PdfLayout(pdf))
-            exclusions.extend({"doc_id": doc["doc_id"], "semantic_id": u["semantic_id"],
+            exclusions.extend({"doc_id": doc["doc_id"], "pdf_page": u["pdf_page"], "semantic_id": u["semantic_id"],
                                "reason": "正文起始页之前的封面、前言或目录"} for u in excluded)
             lines = [f"# 文档：{doc['filename']}"]
             index = 0
@@ -267,19 +281,46 @@ def build(job_id):
                 label = str(event["pdf_page"])
                 if event["end_pdf_page"] != event["pdf_page"]:
                     label += f"-{event['end_pdf_page']}"
-                text = "\n\n".join(event.pop("parts"))
-                event.update({"text": text, "export_id": f"{doc['doc_id']}-txt-{index:04d}"})
+                rendered_parts = event.pop("parts")
+                raw_parts = event.pop("raw_source_parts")
+                text = "\n\n".join(rendered_parts)
+                raw_text = "\n".join(raw_parts)
+                transform_map, raw_offset, text_offset = [], 0, 0
+                for semantic_id, raw_part, rendered_part in zip(event["source_semantic_ids"], raw_parts, rendered_parts):
+                    transform_map.append({"semantic_id": semantic_id,
+                        "raw_start": raw_offset, "raw_end": raw_offset + len(raw_part),
+                        "rendered_start": text_offset, "rendered_end": text_offset + len(rendered_part),
+                        "status": "unchanged" if raw_part == rendered_part else "transformed"})
+                    raw_offset += len(raw_part) + 1
+                    text_offset += len(rendered_part) + 2
+                event.update({"text": text, "raw_source_text": raw_text,
+                              "transform_map": transform_map,
+                              "parse_version": parse_version, "source_pdf_sha256": doc.get("sha256"),
+                              "export_id": f"{doc['doc_id']}-txt-{index:04d}"})
                 records.append(event)
                 warnings.extend(event["warnings"])
                 context = "章节：" + " > ".join(event["section"]) + "\n" if event["section"] else ""
                 lines.append(f"## 证据块 {index:04d} | PDF 页 {label}\n{context}{text}")
             sections.append("\n\n".join(lines))
-    content = "\n\n".join(sections).strip() + "\n"
+    notice = ["# 整理版 TXT（未经逐页人工验收）", "解析版本：" + ", ".join(parse_version),
+              f"待核实提取问题：{sum(x.get('status') == '待处理' for x in quality_issues)} 项。",
+              "字符范围以对应解析候选原文的 Python Unicode 左闭右开索引为准；整理文字不可替代 PDF 原文。"]
+    if exclusions:
+        notice.append(f"整理展示排除 {len(exclusions)} 项；详情见 parsed/txt_report.json，原始解析页和 PDF 保留。")
+    for issue in quality_issues:
+        notice.append(f"提取告警：{issue['doc_id']} PDF 第 {issue['pdf_page']} 页 | "
+                      f"{issue['code']} | {issue['severity']} | {issue['status']} | {issue['message'][:160]}")
+    for exclusion in exclusions:
+        notice.append(f"展示排除：{exclusion['doc_id']} PDF 第 {exclusion.get('pdf_page', '?')} 页 | {exclusion['reason']}")
+    content = "\n".join(notice) + "\n\n" + "\n\n".join(sections).strip() + "\n"
     # Unknown private glyphs remain visible and are reported, never silently dropped.
     unknown = sorted({c for c in content if 0xE000 <= ord(c) <= 0xF8FF or 0xF0000 <= ord(c) <= 0x10FFFD})
     if unknown:
         warnings.append("存在未映射的 PDF 字符：" + ", ".join(f"U+{ord(c):04X}" for c in unknown))
     report = {"filename": "semantic_corpus.txt", "format_version": VERSION,
+              "parse_versions": parse_version,
+              "quality_issues": len(quality_issues),
+              "pending_quality_issues": sum(x.get("status") == "待处理" for x in quality_issues),
               "documents": len(meta["documents"]), "pages": len(pages),
               "semantic_units": len(records), "merged_cross_page": merged_cross_page,
               "chars": len(content), "excluded_frontmatter_units": sum("semantic_id" in e for e in exclusions),

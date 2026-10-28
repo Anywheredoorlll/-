@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import unicodedata
 import uuid
@@ -15,10 +16,16 @@ from pathlib import Path
 
 import pymupdf as fitz
 
+from aviation_ft import claim_validation, extraction_quality, layout, numeric_validation, review_policy
+
 ROOT = Path(__file__).resolve().parents[2]
 JOB_RE = re.compile(r"^[0-9a-f]{32}$")
 SPLITS = {"train", "validation", "test"}
 DECISIONS = {"approved", "approved_after_edit", "regenerate", "rejected", "pending_expert_review"}
+
+
+class RevisionConflict(ValueError):
+    """A reviewer submitted an older candidate revision."""
 CLAUSE_START_RE = re.compile(r"^(?:\d+(?:\.\d+){1,}\s+|第[一二三四五六七八九十百零〇\d]+[章节条]\s*|[（(]\d+[）)]\s*)")
 TABLE_TITLE_RE = re.compile(r"^表\s*\d")
 HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)*\s+\S|第[一二三四五六七八九十百零〇\d]+章)")
@@ -35,6 +42,10 @@ def now() -> str:
 
 def settings() -> dict:
     return json.loads((ROOT / "configs/settings.json").read_text(encoding="utf-8"))
+
+
+def quality_settings() -> dict:
+    return read_json(ROOT / "configs/quality.json", {})
 
 
 def jobs_root() -> Path:
@@ -224,6 +235,7 @@ def remove_unparsed_pdf(job_id: str, filename: str) -> None:
     source = p / "raw_pdf" / filename
     if source.is_symlink() or not source.is_file() or sha256_file(source) != document["sha256"]:
         raise ValueError("原始 PDF 缺失或哈希变化，拒绝移除")
+    source.chmod(stat.S_IWRITE | stat.S_IREAD)
     source.unlink()
     meta["documents"] = [d for d in meta["documents"] if d["filename"] != filename]
     meta["status"] = "uploaded" if meta["documents"] else "created"
@@ -335,12 +347,16 @@ def _nearby_vertical(previous: dict, current: dict) -> bool:
 def semantic_blocks_for_page(page: dict, previous_page: dict | None = None) -> list[dict]:
     """Derive readable clauses/tables without replacing auditable raw PDF blocks."""
     raw_blocks = page.get("blocks", [])
-    content_blocks = _content_blocks(page)
+    retained = {b["block_id"] for b in _content_blocks(page)}
+    regions = layout.detect_regions(page, _block_kind)
+    ordered, order_status = layout.infer_reading_order(regions)
+    content_blocks = [b for b in ordered if b["block_id"] in retained]
+    group_starts = {group[0]["block_id"] for group in layout.propose_semantic_groups(content_blocks)}
     if not content_blocks:
         return []
     groups: list[tuple[str, list[dict]]] = []
     for block_index, block in enumerate(content_blocks):
-        kind = _block_kind(block)
+        kind = block.get("region_kind", _block_kind(block))
         if not groups:
             groups.append((kind, [block]))
             continue
@@ -389,10 +405,14 @@ def semantic_blocks_for_page(page: dict, previous_page: dict | None = None) -> l
 
     result = []
     previous_semantic = semantic_blocks_for_page(previous_page) if previous_page else []
+    section_path = list(previous_semantic[-1].get("section_path", [])) if previous_semantic else []
     for index, (kind, blocks) in enumerate(groups, 1):
         raw_text = "\n".join(str(block["text"]).rstrip("\n") for block in blocks).strip()
         text = raw_text if kind == "table" else _prose_text(blocks)
-        raw_positions = [raw_blocks.index(block) for block in blocks]
+        if kind == "heading":
+            section_path = [text]
+        raw_positions = [next(i for i, raw in enumerate(raw_blocks)
+                              if raw["block_id"] == block["block_id"]) for block in blocks]
         range_start, range_end = min(raw_positions), max(raw_positions)
         start_id = raw_blocks[range_start]["block_id"]
         end_id = raw_blocks[range_end]["block_id"]
@@ -445,6 +465,17 @@ def semantic_blocks_for_page(page: dict, previous_page: dict | None = None) -> l
             "text": text,
             "raw_text": raw_text,
             "kind": kind,
+            "section_path": list(section_path),
+            "column_id": blocks[0].get("column_id", 0),
+            "order_status": order_status,
+            "reading_order_index": index - 1,
+            "layout_proposal_start": blocks[0]["block_id"] in group_starts,
+            "source_fragments": [{"order": n, "block_id": block["block_id"],
+                "pdf_page": page["pdf_page"],
+                "candidate_id": page.get("extraction_candidate_id"),
+                "char_start": 0, "char_end": len(block["text"]),
+                "source_text_sha256": extraction_quality.digest_text(block["text"])}
+                for n, block in enumerate(blocks)],
             "possible_continuation_from_previous_page": starts_mid_sentence,
             "possible_continuation_to_next_page": ends_mid_sentence,
             "ocr_used": any(bool(block.get("ocr_used")) for block in blocks),
@@ -455,7 +486,7 @@ def semantic_blocks_for_page(page: dict, previous_page: dict | None = None) -> l
     return result
 
 
-def semantic_blocks_for_document(pages: list[dict]) -> list[dict]:
+def semantic_blocks_for_document(pages: list[dict], confirmed_pairs: set[tuple[str, str]] | None = None) -> list[dict]:
     """Join adjacent-page continuations and retain a locator for every raw block."""
     result = []
     previous_page = None
@@ -466,7 +497,9 @@ def semantic_blocks_for_document(pages: list[dict]) -> list[dict]:
         parts = semantic_blocks_for_page(page, previous_page if adjacent else None)
         for index, part in enumerate(parts):
             part = dict(part, doc_id=page["doc_id"], pdf_page=page["pdf_page"],
-                        end_pdf_page=page["pdf_page"])
+                        end_pdf_page=page["pdf_page"],
+                        parse_version=page.get("parse_version", "legacy"),
+                        quality_issue_ids=page.get("quality_issue_ids", []))
             part["source_locations"] = [
                 {"pdf_page": page["pdf_page"], "block_id": bid, "bbox": box}
                 for bid, box in zip(part["block_ids"], part["bboxes"])
@@ -476,7 +509,14 @@ def semantic_blocks_for_document(pages: list[dict]) -> list[dict]:
                 part["kind"] == previous["kind"]
                 or (part["kind"] == "prose" and previous["kind"] == "list_item")
             )
-            if (adjacent and index == 0 and compatible
+            merge_review = layout.evaluate_cross_page_merge(previous, part, quality_settings()) if previous else None
+            part["cross_page_merge"] = merge_review
+            auto_merge = (page.get("parse_version") != extraction_quality.PARSE_VERSION
+                          or bool(previous and (previous["semantic_id"], part["semantic_id"])
+                                  in (confirmed_pairs or set())))
+            if (auto_merge and adjacent and index == 0 and compatible
+                    and (page.get("parse_version") != extraction_quality.PARSE_VERSION
+                         or (merge_review and merge_review["decision"] == "proposed"))
                     and part["possible_continuation_from_previous_page"]
                     and previous["possible_continuation_to_next_page"]
                     and len(previous["text"]) + len(part["text"]) <= 12000):
@@ -489,6 +529,13 @@ def semantic_blocks_for_document(pages: list[dict]) -> list[dict]:
                 previous["block_ids"] += part["block_ids"]
                 previous["bboxes"] += part["bboxes"]
                 previous["source_locations"] += part["source_locations"]
+                offset = len(previous["source_fragments"])
+                previous["source_fragments"] += [
+                    {**fragment, "order": offset + position}
+                    for position, fragment in enumerate(part.get("source_fragments", []))]
+                previous["quality_issue_ids"] = sorted(set(previous.get("quality_issue_ids", []))
+                                                        | set(part.get("quality_issue_ids", [])))
+                previous["cross_page_merge"] = {"decision": "confirmed", "rule_version": layout.LAYOUT_VERSION}
                 previous["end_block_id"] = part["end_block_id"]
                 previous["end_pdf_page"] = page["pdf_page"]
                 previous["block_id"] = (
@@ -509,16 +556,28 @@ def parse_job(job_id: str) -> dict:
     p = job_dir(job_id)
     if (p / "evidence/units.jsonl").exists():
         raise ValueError("已有证据单元，不能重新解析；请创建新任务")
+    if (p / "parsed/pages.jsonl").exists():
+        existing = read_json(p / "parsed/report.json")
+        if existing:
+            return existing
+        raise ValueError("已有不完整解析结果；请显式迁移或复制任务，不能覆盖")
     meta = load_job(job_id)
     if not meta["documents"]:
         raise ValueError("请先上传 PDF")
     pages = []
     cfg = settings()
     ocr_languages = cfg.get("ocr_languages", "chi_sim+eng")
-    ocr_dpi = int(cfg.get("ocr_dpi", 200))
+    ocr_dpi = int(cfg.get("ocr_dpi", 300))
+    qcfg = quality_settings()
+    extraction_cfg_hash = extraction_quality.config_hash({"ocr_languages": ocr_languages,
+        "ocr_dpi": ocr_dpi, "ocr_tessdata": cfg.get("ocr_tessdata"), **qcfg})
     tessdata = Path(cfg.get("ocr_tessdata", "models/ocr/tessdata"))
     tessdata = str(tessdata if tessdata.is_absolute() else ROOT / tessdata)
-    counts = {"pages": 0, "blocks": 0, "ocr_pages": 0, "ocr_blocks": 0, "possible_scanned_pages": 0}
+    counts = {"pages": 0, "blocks": 0, "ocr_pages": 0, "ocr_blocks": 0,
+              "possible_scanned_pages": 0, "successful_pages": 0,
+              "failed_pages": 0, "needs_review_pages": 0,
+              "parse_version": extraction_quality.PARSE_VERSION}
+    candidates, issues, page_quality = [], [], []
     for entry in meta["documents"]:
         path = p / "raw_pdf" / entry["filename"]
         if sha256_file(path) != entry["sha256"]:
@@ -526,58 +585,106 @@ def parse_job(job_id: str) -> dict:
         with fitz.open(path) as doc:
             previous_page = None
             for idx, page in enumerate(doc):
-                def extract_blocks(textpage=None, ocr_block_numbers=frozenset()):
-                    result = []
-                    for raw in page.get_text("blocks", textpage=textpage):
-                        if len(raw) < 7 or raw[6] != 0 or not str(raw[4]).strip():
-                            continue
-                        block_id = f"{entry['doc_id']}-p{idx + 1:04d}-b{len(result) + 1:04d}"
-                        result.append({"block_id": block_id,
-                            "bbox": [round(float(x), 2) for x in raw[:4]],
-                            "text": str(raw[4]),
-                            "ocr_used": raw[5] in ocr_block_numbers,
-                        })
-                    return result
-
-                blocks = extract_blocks()
+                native_error = None
+                try:
+                    native = extraction_quality.extract_native_page(page, entry["doc_id"], idx + 1)
+                except Exception as exc:
+                    native_error = f"原生文字提取失败：{exc}"
+                    native = {"candidate_id": "native-failed", "method": "native",
+                              "text": "", "blocks": [],
+                              "text_sha256": extraction_quality.digest_text(""),
+                              "engine": "PyMuPDF", "engine_version": getattr(fitz, "VersionBind", "unknown"),
+                              "settings": {}, "quality": {}}
+                native["candidate_id"] = f"{entry['doc_id']}-p{idx + 1:04d}-{native['candidate_id']}"
+                native_quality = extraction_quality.assess_page_extraction(page, native, qcfg)
+                decision = extraction_quality.decide_ocr(native_quality, qcfg)
+                if native_error:
+                    decision = {"attempt": True, "mode": "full_page", "reasons": [native_error]}
+                ocr, ocr_errors = None, []
+                if decision["attempt"]:
+                    for attempt in range(max(1, int(qcfg.get("ocr_max_attempts", 2)))):
+                        dpi = ocr_dpi if attempt == 0 else int(qcfg.get("ocr_retry_dpi", 400))
+                        try:
+                            ocr = extraction_quality.extract_ocr_page(
+                                page, entry["doc_id"], idx + 1, ocr_languages,
+                                dpi, decision["mode"], tessdata)
+                            ocr["candidate_id"] = f"{entry['doc_id']}-p{idx + 1:04d}-{ocr['candidate_id']}"
+                            extraction_quality.assess_page_extraction(page, ocr, qcfg)
+                            break
+                        except Exception as exc:
+                            ocr_errors.append(f"OCR {dpi} DPI 失败：{exc}")
+                comparison = extraction_quality.compare_extractions(native, ocr, qcfg) if ocr else None
+                selection = extraction_quality.select_extraction(native, ocr, comparison, ocr_errors if not ocr else [])
+                selected = next(c for c in (native, ocr) if c and c["candidate_id"] == selection["selected_candidate_id"])
+                blocks = selected["blocks"]
                 text_len = sum(len(b["text"].strip()) for b in blocks)
-                ocr_used = text_len < 30 and bool(page.get_image_info())
-                if ocr_used:
-                    try:
-                        textpage = page.get_textpage_ocr(language=ocr_languages, dpi=ocr_dpi, full=False, tessdata=tessdata)
-                        ocr_block_numbers = {
-                            block["number"]
-                            for block in page.get_text("dict", textpage=textpage)["blocks"]
-                            if any(
-                                span["font"] == "GlyphLessFont"
-                                for line in block.get("lines", [])
-                                for span in line["spans"]
-                            )
-                        }
-                        blocks = extract_blocks(textpage=textpage, ocr_block_numbers=ocr_block_numbers)
-                    except Exception as exc:
-                        raise ValueError(
-                            f"OCR 失败：{entry['filename']} 第 {idx + 1} 页。"
-                            f"请检查 ocr_tessdata 目录中是否有 {ocr_languages} 的语言包；原因：{exc}"
-                        ) from exc
-                    text_len = sum(len(b["text"].strip()) for b in blocks)
-                scanned = text_len < 30
+                ocr_used = bool(ocr and selected is ocr)
+                scanned = text_len < qcfg.get("min_nonspace_chars", 30) and bool(page.get_image_info())
+                page_issue_ids = []
+                def add_page_issue(code: str, severity: str, message: str):
+                    issue_id = f"QI-{entry['doc_id']}-p{idx + 1:04d}-{len(page_issue_ids) + 1:02d}"
+                    page_issue_ids.append(issue_id)
+                    issues.append({"issue_id": issue_id, "code": code, "severity": severity,
+                        "doc_id": entry["doc_id"], "pdf_page": idx + 1,
+                        "candidate_ids": [c["candidate_id"] for c in (native, ocr) if c],
+                        "block_ids": [b["block_id"] for b in blocks],
+                        "bboxes": [b["bbox"] for b in blocks], "message": message,
+                        "status": "待处理", "resolved_by": None, "resolution_reason": None,
+                        "parse_version": extraction_quality.PARSE_VERSION})
+                if decision["attempt"] and not ocr:
+                    add_page_issue("ocr_failed", "blocker", "；".join(ocr_errors))
+                    counts["failed_pages"] += 1
+                if native_error:
+                    add_page_issue("native_failed", "blocker", native_error)
+                if comparison and comparison["requires_source_review"]:
+                    add_page_issue("native_ocr_conflict", "blocker", "原生文字与 OCR 存在差异或关键事实冲突")
+                if decision["attempt"] and not page_issue_ids:
+                    add_page_issue("ocr_source_review", "warning", "OCR 候选需对照 PDF 核实")
                 parsed_page = {
                     "doc_id": entry["doc_id"], "filename": entry["filename"],
                     "pdf_page": idx + 1, "printed_page": None,
                     "width": round(float(page.rect.width), 2),
                     "height": round(float(page.rect.height), 2),
                     "blocks": blocks, "ocr_used": ocr_used, "possible_scanned": scanned,
+                    "parse_version": extraction_quality.PARSE_VERSION,
+                    "source_pdf_sha256": entry["sha256"],
+                    "extraction_candidate_id": selected["candidate_id"],
+                    "extraction_method": selected["method"],
+                    "extraction_config_hash": extraction_cfg_hash,
+                    "quality_issue_ids": page_issue_ids,
+                    "extraction_selection": selection,
+                    "quality": {**selected["quality"], "native_ocr_conflicts": comparison["conflicts"] if comparison else []},
                 }
                 parsed_page["semantic_blocks"] = semantic_blocks_for_page(parsed_page, previous_page)
+                table_risks = [s["semantic_id"] for s in parsed_page["semantic_blocks"] if s["kind"] == "table"]
+                order_risks = [s["semantic_id"] for s in parsed_page["semantic_blocks"] if s["order_status"] == "needs_review"]
+                parsed_page["quality"]["table_risks"] = table_risks
+                parsed_page["quality"]["reading_order_risks"] = order_risks
+                if table_risks:
+                    add_page_issue("table_structure", "warning", "检测到表格区域，行列及脚注需对照 PDF 核实")
+                if order_risks:
+                    add_page_issue("reading_order", "blocker", "阅读顺序存在歧义")
+                parsed_page["quality_status"] = "needs_review" if page_issue_ids else "pass"
                 pages.append(parsed_page)
+                for candidate in (native, ocr):
+                    if candidate:
+                        candidates.append({"doc_id": entry["doc_id"], "pdf_page": idx + 1,
+                                           "source_pdf_sha256": entry["sha256"], **candidate})
+                page_quality.append({"doc_id": entry["doc_id"], "pdf_page": idx + 1,
+                                     "quality_status": parsed_page["quality_status"],
+                                     "quality_issue_ids": page_issue_ids, **parsed_page["quality"]})
                 previous_page = parsed_page
                 counts["pages"] += 1
                 counts["blocks"] += len(blocks)
                 counts["ocr_pages"] += int(ocr_used)
                 counts["ocr_blocks"] += sum(b["ocr_used"] for b in blocks)
                 counts["possible_scanned_pages"] += int(scanned)
+                counts["successful_pages"] += int(not page_issue_ids)
+                counts["needs_review_pages"] += int(bool(page_issue_ids))
     write_jsonl(p / "parsed/pages.jsonl", pages)
+    write_jsonl(p / "parsed/extraction_candidates.jsonl", candidates)
+    write_jsonl(p / "parsed/issues.jsonl", issues)
+    write_jsonl(p / "parsed/page_quality.jsonl", page_quality)
     txt_report = build_semantic_txt(job_id)
     counts["semantic_units"] = txt_report["semantic_units"]
     counts["semantic_txt_chars"] = txt_report["chars"]
@@ -591,8 +698,196 @@ def pages_for(job_id: str) -> list[dict]:
     return read_jsonl(job_dir(job_id) / "parsed/pages.jsonl")
 
 
+def confirmed_merge_pairs(job_id: str) -> set[tuple[str, str]]:
+    return {(row["start_semantic_id"], row["end_semantic_id"])
+            for row in read_jsonl(job_dir(job_id) / "parsed/cross_page_decisions.jsonl")
+            if row.get("decision") == "confirmed"}
+
+
+def cross_page_merge_proposals(job_id: str) -> list[dict]:
+    proposals = []
+    confirmed = confirmed_merge_pairs(job_id)
+    documents = load_job(job_id)["documents"]
+    pages = pages_for(job_id)
+    for document in documents:
+        parts = semantic_blocks_for_document([p for p in pages if p["doc_id"] == document["doc_id"]])
+        for previous, current in zip(parts, parts[1:]):
+            if (current["pdf_page"] != previous["end_pdf_page"] + 1
+                    or not previous.get("possible_continuation_to_next_page")
+                    or not current.get("possible_continuation_from_previous_page")):
+                continue
+            decision = layout.evaluate_cross_page_merge(previous, current, quality_settings())
+            if (previous["semantic_id"], current["semantic_id"]) in confirmed:
+                decision = {**decision, "decision": "confirmed"}
+            proposals.append({"doc_id": document["doc_id"], "filename": document["filename"],
+                "start_semantic_id": previous["semantic_id"], "end_semantic_id": current["semantic_id"],
+                "start_page": previous["pdf_page"], "end_page": current["pdf_page"],
+                "start_text": previous["text"], "end_text": current["text"],
+                **decision})
+    return proposals
+
+
 def evidence_for(job_id: str) -> list[dict]:
     return read_jsonl(job_dir(job_id) / "evidence/units.jsonl")
+
+
+def current_evidence_units(job_id: str) -> list[dict]:
+    """Read source records with live PDF, parsed-text and issue integrity flags."""
+    root = job_dir(job_id)
+    pages = {(p["doc_id"], p["pdf_page"]): p for p in pages_for(job_id)}
+    issues = {i["issue_id"]: i for i in read_jsonl(root / "parsed/issues.jsonl")}
+    documents = {d["doc_id"]: d for d in load_job(job_id)["documents"]}
+    pdf_hashes = {}
+    result = []
+    for stored in evidence_for(job_id):
+        unit = dict(stored)
+        blockers = list(unit.get("unresolved_blockers", []))
+        document = documents.get(unit.get("doc_id"))
+        if document:
+            if document["doc_id"] not in pdf_hashes:
+                path = root / "raw_pdf" / document["filename"]
+                pdf_hashes[document["doc_id"]] = sha256_file(path) if path.is_file() else None
+            if (pdf_hashes[document["doc_id"]] != document["sha256"]
+                    or unit.get("source_pdf_sha256") != document["sha256"]):
+                blockers.append("PDF 文件身份已变化")
+        else:
+            blockers.append("来源文档不存在")
+        if extraction_quality.digest_text(unit.get("source_text", "")) != unit.get("source_text_sha256"):
+            blockers.append("证据文本哈希不匹配")
+        for issue_id in unit.get("quality_issue_ids", []):
+            if issues.get(issue_id, {}).get("status") not in {"已核实", "已排除"}:
+                blockers.append(f"页面问题未解决：{issue_id}")
+        for fragment in unit.get("source_fragments", []):
+            page = pages.get((unit.get("doc_id"), fragment.get("pdf_page")))
+            block = next((b for b in page.get("blocks", []) if b["block_id"] == fragment.get("block_id")), None) if page else None
+            if (not page or not block
+                    or page.get("parse_version") != unit.get("parse_version")
+                    or page.get("extraction_candidate_id") != fragment.get("candidate_id")
+                    or extraction_quality.digest_text(block["text"]) != fragment.get("source_text_sha256")):
+                blockers.append("来源片段或解析版本已变化")
+        unit["unresolved_blockers"] = list(dict.fromkeys(blockers))
+        result.append(unit)
+    return result
+
+
+def _build_evidence_record(job_id: str, page: dict, source: dict, quote: str,
+                           topic: str, clause_group: str, split: str, reviewer: str) -> dict:
+    """Bind every evidence entry to immutable parsed blocks; never trust caller locators."""
+    pages = {(p["doc_id"], p["pdf_page"]): p for p in pages_for(job_id)}
+    locations = source.get("source_locations") or [
+        {"pdf_page": page["pdf_page"], "block_id": bid, "bbox": box}
+        for bid, box in zip(source["block_ids"], source["bboxes"])
+    ]
+    fragments, issue_ids = [], set()
+    for position, loc in enumerate(locations):
+        origin = pages.get((page["doc_id"], loc["pdf_page"]))
+        block = next((b for b in origin["blocks"] if b["block_id"] == loc["block_id"]), None) if origin else None
+        if not block or block["bbox"] != loc["bbox"]:
+            raise ValueError("证据来源位置与解析原文不一致")
+        issue_ids.update(origin.get("quality_issue_ids", []))
+        fragments.append({"order": position, "pdf_page": loc["pdf_page"],
+            "block_id": block["block_id"], "candidate_id": origin.get("extraction_candidate_id"),
+            "source_text_sha256": extraction_quality.digest_text(block["text"]),
+            "char_start": 0, "char_end": len(block["text"]),
+            "bbox": block["bbox"]})
+    text = source["source_text"]
+    start = text.find(quote)
+    if start < 0 or not quote:
+        raise ValueError("引用必须是来源文本的精确子串")
+    if text.find(quote, start + 1) >= 0:
+        raise ValueError("引用在来源中重复，请缩小范围或人工消歧")
+    if len(fragments) == 1 and text == pages[(page["doc_id"], page["pdf_page"])]["blocks"][
+            next(i for i, b in enumerate(page["blocks"]) if b["block_id"] == fragments[0]["block_id"])]["text"]:
+        fragments[0]["char_start"], fragments[0]["char_end"] = start, start + len(quote)
+    ocr_used = any(pages[(page["doc_id"], loc["pdf_page"])]["blocks"][
+        next(i for i, b in enumerate(pages[(page["doc_id"], loc["pdf_page"])]["blocks"])
+             if b["block_id"] == loc["block_id"])].get("ocr_used") for loc in locations)
+    risks = list(source.get("quality_issues", []))
+    if ocr_used:
+        risks.append("OCR 来源需对照 PDF 核实")
+    return {"evidence_unit_id": f"EU-{uuid.uuid4().hex[:12]}",
+        "evidence_schema_version": "evidence-v2", "parse_version": page.get("parse_version", "legacy"),
+        "source_pdf_sha256": page.get("source_pdf_sha256"),
+        "source_text_sha256": extraction_quality.digest_text(text),
+        "source_fragments": fragments, "source_locations": locations,
+        "quality_issue_ids": sorted(issue_ids), "unresolved_blockers": risks,
+        "source_verification": {"status": "draft", "reviewer": None, "verified_at": None},
+        "doc_id": page["doc_id"], "filename": page["filename"],
+        "pdf_page": page["pdf_page"], "end_pdf_page": max(loc["pdf_page"] for loc in locations),
+        "printed_page": page.get("printed_page"), "block_id": source["block_id"],
+        "block_ids": source["block_ids"], "bbox": source["bbox"], "bboxes": source["bboxes"],
+        "source_text": text, "raw_source_text": source.get("raw_source_text", text),
+        "text_reconstructed": bool(source.get("text_reconstructed")),
+        "quote": quote, "char_start": start, "char_end": start + len(quote),
+        "topic": topic.strip(), "clause_group": clause_group.strip(), "split": split,
+        "scope": "block_range" if len(fragments) > 1 else "block",
+        "ocr_used": bool(ocr_used), "cross_page_merge": source.get("cross_page_merge"),
+        "confirmed_by": reviewer,
+        "confirmed_at": now(), "confirmation_mode": "automated" if reviewer.startswith("model:") else "human"}
+
+
+def verify_evidence_source(job_id: str, evidence_unit_id: str, reviewer: str,
+                           reason: str) -> dict:
+    """Explicit human PDF verification; historical automated assessments never count."""
+    if not reviewer.strip() or reviewer.startswith("model:") or not reason.strip():
+        raise ValueError("请填写人工核对人和核对依据")
+    p = job_dir(job_id)
+    if (p / "evidence/splits.json").exists():
+        raise ValueError("证据已冻结，请复制任务建立新版本")
+    records = evidence_for(job_id)
+    matches = [r for r in records if r["evidence_unit_id"] == evidence_unit_id]
+    if len(matches) != 1:
+        raise ValueError("证据不存在或不唯一")
+    record = matches[0]
+    if record.get("evidence_schema_version") != "evidence-v2":
+        raise ValueError("旧证据需通过显式迁移建立新版本，不能直接标为来源已核实")
+    document = next((d for d in load_job(job_id)["documents"] if d["doc_id"] == record["doc_id"]), None)
+    if not document or sha256_file(p / "raw_pdf" / document["filename"]) != document["sha256"]:
+        raise ValueError("原始 PDF 缺失或哈希不符")
+    if (record.get("source_pdf_sha256") != document["sha256"]
+            or extraction_quality.digest_text(record.get("source_text", "")) != record.get("source_text_sha256")):
+        raise ValueError("证据来源文件或文字哈希不匹配")
+    issues = {i["issue_id"]: i for i in read_jsonl(p / "parsed/issues.jsonl")}
+    unresolved = [iid for iid in record.get("quality_issue_ids", [])
+                  if issues.get(iid, {}).get("status") not in {"已排除", "已核实"}]
+    if unresolved:
+        raise ValueError("来源页面仍有未处理问题：" + ", ".join(unresolved))
+    page_map = {(page["doc_id"], page["pdf_page"]): page for page in pages_for(job_id)}
+    for fragment in record.get("source_fragments", []):
+        origin = page_map.get((record["doc_id"], fragment["pdf_page"]))
+        block = next((b for b in origin["blocks"] if b["block_id"] == fragment["block_id"]), None) if origin else None
+        if (not block or origin.get("parse_version") != record.get("parse_version")
+                or origin.get("extraction_candidate_id") != fragment.get("candidate_id")
+                or extraction_quality.digest_text(block["text"]) != fragment["source_text_sha256"]):
+            raise ValueError("来源文本版本已变化")
+    record["unresolved_blockers"] = []
+    record["source_verification"] = {"status": "source_verified", "reviewer": reviewer.strip(),
+                                      "verified_at": now(), "reason": reason.strip(),
+                                      "source_pdf_sha256": document["sha256"]}
+    write_jsonl(p / "evidence/units.jsonl", records)
+    append_jsonl(p / "evidence/verification_events.jsonl", {"evidence_unit_id": evidence_unit_id,
+        "at": now(), "reviewer": reviewer.strip(), "reason": reason.strip(),
+        "source_pdf_sha256": document["sha256"]})
+    return record
+
+
+def resolve_quality_issue(job_id: str, issue_id: str, status: str, reviewer: str,
+                          reason: str) -> dict:
+    if status not in {"已修正", "已排除", "已核实"} or not reviewer.strip() or not reason.strip():
+        raise ValueError("必须填写有效处理状态、处理人和理由")
+    p = job_dir(job_id)
+    if (p / "evidence/splits.json").exists():
+        raise ValueError("来源已冻结，请复制任务建立新版本")
+    issues = read_jsonl(p / "parsed/issues.jsonl")
+    matches = [i for i in issues if i["issue_id"] == issue_id]
+    if len(matches) != 1:
+        raise ValueError("问题不存在或不唯一")
+    issue = matches[0]
+    issue.update({"status": status, "resolved_by": reviewer.strip(),
+                  "resolution_reason": reason.strip(), "resolved_at": now()})
+    write_jsonl(p / "parsed/issues.jsonl", issues)
+    append_jsonl(p / "parsed/issue_events.jsonl", dict(issue))
+    return issue
 
 def build_semantic_txt(job_id: str) -> dict:
     """Build an ordered, readable evidence-block corpus from every parsed PDF."""
@@ -611,9 +906,28 @@ def build_semantic_txt(job_id: str) -> dict:
         if os.path.exists(tmp):
             os.unlink(tmp)
     report["sha256"] = sha256_file(target)
+    report["pages_sha256"] = sha256_file(p / "parsed/pages.jsonl")
+    issue_path = p / "parsed/issues.jsonl"
+    report["issues_sha256"] = sha256_file(issue_path) if issue_path.is_file() else None
+    decisions = p / "parsed/cross_page_decisions.jsonl"
+    report["cross_page_decisions_sha256"] = sha256_file(decisions) if decisions.is_file() else None
     write_jsonl(p / "parsed/readable_units.jsonl", records)
     write_json(p / "parsed/txt_report.json", {**report, "exclusions": exclusions})
     return report
+
+
+def txt_is_current(job_id: str) -> bool:
+    root = job_dir(job_id)
+    path = root / "parsed/semantic_corpus.txt"
+    pages = root / "parsed/pages.jsonl"
+    issues = root / "parsed/issues.jsonl"
+    decisions = root / "parsed/cross_page_decisions.jsonl"
+    report = read_json(root / "parsed/txt_report.json", {})
+    return (path.is_file() and pages.is_file()
+            and report.get("sha256") == sha256_file(path)
+            and report.get("pages_sha256") == sha256_file(pages)
+            and report.get("issues_sha256") == (sha256_file(issues) if issues.is_file() else None)
+            and report.get("cross_page_decisions_sha256") == (sha256_file(decisions) if decisions.is_file() else None))
 
 
 def add_evidence(job_id: str, block_id: str, topic: str, clause_group: str, split: str, quote: str | None = None) -> dict:
@@ -634,7 +948,10 @@ def add_evidence(job_id: str, block_id: str, topic: str, clause_group: str, spli
     records = evidence_for(job_id)
     if any(r["block_id"] == block_id and r["quote"] == quote for r in records):
         raise ValueError("证据单元重复")
-    record = {"evidence_unit_id": f"EU-{uuid.uuid4().hex[:12]}", "doc_id": page["doc_id"], "filename": page["filename"], "pdf_page": page["pdf_page"], "printed_page": page["printed_page"], "block_id": block_id, "bbox": block["bbox"], "source_text": text, "quote": quote, "char_start": start, "char_end": start + len(quote), "topic": topic.strip(), "clause_group": clause_group.strip(), "split": split, "confirmed_at": now()}
+    source_record = {"block_id": block_id, "block_ids": [block_id], "bbox": block["bbox"],
+                     "bboxes": [block["bbox"]], "source_text": text, "raw_source_text": text,
+                     "ocr_used": block.get("ocr_used", False)}
+    record = _build_evidence_record(job_id, page, source_record, quote, topic, clause_group, split, "manual:unknown")
     records.append(record)
     write_jsonl(p / "evidence/units.jsonl", records)
     return record
@@ -703,28 +1020,70 @@ def add_evidence_range(
         for r in records
     ):
         raise ValueError("同一章节/相邻条款组跨 split")
-    record = {
-        "evidence_unit_id": f"EU-{uuid.uuid4().hex[:12]}",
-        "doc_id": doc_id, "filename": page["filename"],
-        "pdf_page": pdf_page, "printed_page": page["printed_page"],
-        "block_id": source["block_id"], "block_ids": source["block_ids"],
-        "bbox": source["bbox"], "bboxes": source["bboxes"],
-        "source_text": text, "quote": quote,
-        "raw_source_text": source.get("raw_source_text", text),
-        "text_reconstructed": bool(source.get("text_reconstructed")),
-        "char_start": start, "char_end": start + len(quote),
-        "topic": topic.strip(), "clause_group": clause_group.strip(),
-        "split": split, "scope": "block_range", "ocr_used": source["ocr_used"],
-        "confirmed_by": reviewer.strip(), "confirmed_at": now(),
-    }
+    record = _build_evidence_record(job_id, page, source, quote, topic, clause_group, split, reviewer.strip())
     records.append(record)
     write_jsonl(p / "evidence/units.jsonl", records)
+    return record
+
+
+def add_evidence_cross_page(job_id: str, start_semantic_id: str, end_semantic_id: str,
+                            topic: str, clause_group: str, split: str,
+                            reviewer: str, reason: str, quote: str | None = None) -> dict:
+    """Human-confirm a proposed two-page continuation and save draft evidence."""
+    root = job_dir(job_id)
+    if (root / "evidence/splits.json").exists():
+        raise ValueError("证据已冻结，请创建新任务")
+    if not all(x.strip() for x in (topic, clause_group, reviewer, reason)) or split not in SPLITS:
+        raise ValueError("需填写主题、章节组、分区、核对人及跨页依据")
+    proposal = next((x for x in cross_page_merge_proposals(job_id)
+                     if x["start_semantic_id"] == start_semantic_id and x["end_semantic_id"] == end_semantic_id), None)
+    if not proposal or proposal["decision"] != "proposed":
+        raise ValueError("跨页来源不是可人工确认的连续正文建议")
+    doc_pages = [page for page in pages_for(job_id) if page["doc_id"] == proposal["doc_id"]]
+    units = semantic_blocks_for_document(doc_pages)
+    previous = next(unit for unit in units if unit["semantic_id"] == start_semantic_id)
+    current = next(unit for unit in units if unit["semantic_id"] == end_semantic_id)
+    if previous["kind"] != current["kind"] or previous["kind"] not in {"prose", "list_item"}:
+        raise ValueError("当前仅支持人工确认连续正文；表格需核对列结构后另行处理")
+    text = _prose_text([{"text": previous["text"]}, {"text": current["text"]}])
+    quote = (quote or text).strip()
+    if not quote or text.count(quote) != 1:
+        raise ValueError("跨页引文必须是唯一精确子串")
+    records = evidence_for(job_id)
+    if any(r["doc_id"] == proposal["doc_id"] and r["clause_group"] == clause_group and r["split"] != split for r in records):
+        raise ValueError("同一章节组跨 split")
+    locations = previous["source_locations"] + current["source_locations"]
+    source = {"block_id": start_semantic_id + "--" + end_semantic_id,
+              "block_ids": previous["block_ids"] + current["block_ids"],
+              "source_locations": locations,
+              "bboxes": previous["bboxes"] + current["bboxes"],
+              "bbox": previous["bbox"], "source_text": text,
+              "raw_source_text": previous["raw_text"] + "\n" + current["raw_text"],
+              "text_reconstructed": True, "ocr_used": False,
+              "quality_issues": [],
+              "cross_page_merge": {"decision": "confirmed", "rule_version": layout.LAYOUT_VERSION,
+                                   "start_semantic_id": start_semantic_id,
+                                   "end_semantic_id": end_semantic_id,
+                                   "reviewer": reviewer.strip(), "reason": reason.strip(), "confirmed_at": now()}}
+    if any(r["block_id"] == source["block_id"] and r["quote"] == quote for r in records):
+        raise ValueError("证据单元重复")
+    first_page = next(page for page in doc_pages if page["pdf_page"] == previous["pdf_page"])
+    record = _build_evidence_record(job_id, first_page, source, quote,
+                                    topic, clause_group, split, reviewer)
+    records.append(record)
+    write_jsonl(root / "evidence/units.jsonl", records)
+    append_jsonl(root / "parsed/cross_page_decisions.jsonl", {**source["cross_page_merge"],
+        "doc_id": proposal["doc_id"], "evidence_unit_id": record["evidence_unit_id"]})
     return record
 
 
 def evidence_source_issues(source: dict) -> list[str]:
     """Return deterministic reasons a semantic source is unsafe to auto-approve."""
     issues = []
+    if source.get("order_status") == "needs_review":
+        issues.append("阅读顺序待人工核对")
+    if source.get("quality_issue_ids"):
+        issues.append("页面提取问题尚待核对")
     if source.get("possible_continuation_from_previous_page"):
         issues.append("语义段落从上一页延续，需合并后核实")
     if source.get("possible_continuation_to_next_page"):
@@ -791,12 +1150,23 @@ def evidence_suggestions(job_id: str, doc_id: str, limit: int = 20) -> list[dict
     }
     page_lookup = {page["pdf_page"]: page for page in document_pages}
     all_candidates = []
-    for semantic in semantic_blocks_for_document(document_pages):
+    for semantic in semantic_blocks_for_document(document_pages, confirmed_merge_pairs(job_id)):
         if semantic["kind"] == "heading" or not 40 <= len(semantic["text"]) <= 4000:
             continue
         page = page_lookup[semantic["pdf_page"]]
+        if page.get("quality_issue_ids"):
+            semantic["quality_issues"] = list(dict.fromkeys(
+                semantic.get("quality_issues", []) + ["来源页有待处理提取问题"]))
         all_candidates.append((page, _source_from_semantic_block(page, semantic)))
-    all_bands = sorted({(page["pdf_page"] - 1) // 5 for page, _ in all_candidates})
+    def partition_group(page: dict, source: dict) -> str:
+        section = source.get("section_path") or []
+        if section:
+            label = re.sub(r"\s+", " ", section[-1]).strip()
+            suffix = extraction_quality.digest_text(label)[:8]
+            return f"section-{suffix}-{label[:28]}"
+        band = (page["pdf_page"] - 1) // 5
+        return f"pages-{band * 5 + 1:04d}-{band * 5 + 5:04d}"
+    all_groups = list(dict.fromkeys(partition_group(page, source) for page, source in all_candidates))
     candidates = [
         (page, source) for page, source in all_candidates
         if (page["doc_id"], tuple(source["block_ids"])) not in existing_sources
@@ -804,13 +1174,13 @@ def evidence_suggestions(job_id: str, doc_id: str, limit: int = 20) -> list[dict
     if len(candidates) > limit:
         positions = [round(i * (len(candidates) - 1) / (limit - 1)) for i in range(limit)]
         candidates = [candidates[i] for i in positions]
-    split_by_band = {
-        band: ("train" if i < len(all_bands) * 0.6 else "validation" if i < len(all_bands) * 0.8 else "test")
-        for i, band in enumerate(all_bands)
+    split_by_group = {
+        group: ("train" if i < len(all_groups) * 0.6 else "validation" if i < len(all_groups) * 0.8 else "test")
+        for i, group in enumerate(all_groups)
     }
     result = []
     for page, source in candidates:
-        band = (page["pdf_page"] - 1) // 5
+        group = partition_group(page, source)
         result.append({
             "selected": False,
             "pdf_page": page["pdf_page"],
@@ -828,8 +1198,8 @@ def evidence_suggestions(job_id: str, doc_id: str, limit: int = 20) -> list[dict
             "quality_issues": source["quality_issues"],
             "quote": source["source_text"].strip(),
             "topic": Path(page["filename"]).stem[:50],
-            "clause_group": f"pages-{band * 5 + 1:04d}-{band * 5 + 5:04d}",
-            "split": split_by_band[band],
+            "clause_group": group,
+            "split": split_by_group[group],
         })
     return result
 
@@ -864,7 +1234,7 @@ def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[di
             semantic = next((
                 unit for unit in semantic_blocks_for_document([
                     p for p in pages_for(job_id) if p["doc_id"] == page["doc_id"]
-                ])
+                ], confirmed_merge_pairs(job_id))
                 if unit["start_block_id"] == start_id and unit["end_block_id"] == end_id
             ), None)
             if semantic is None or semantic["quality_issues"]:
@@ -911,27 +1281,7 @@ def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[di
         if group_key in group_splits and group_splits[group_key] != split:
             raise ValueError(f"{block_id}：同一页段/章节组跨 split")
         group_splits[group_key] = split
-        additions.append({
-            "evidence_unit_id": f"EU-{uuid.uuid4().hex[:12]}",
-            "doc_id": page["doc_id"], "filename": page["filename"],
-            "pdf_page": page["pdf_page"], "printed_page": page["printed_page"],
-            "block_id": block_id, "block_ids": source["block_ids"],
-            "bbox": source["bbox"], "bboxes": source["bboxes"],
-            "source_text": text, "quote": quote,
-            "end_pdf_page": source.get("end_pdf_page", page["pdf_page"]),
-            "source_locations": source.get("source_locations", [
-                {"pdf_page": page["pdf_page"], "block_id": bid, "bbox": box}
-                for bid, box in zip(source["block_ids"], source["bboxes"])
-            ]),
-            "raw_source_text": source.get("raw_source_text", text),
-            "text_reconstructed": bool(source.get("text_reconstructed")),
-            "char_start": start, "char_end": start + len(quote),
-            "topic": topic, "clause_group": group, "split": split,
-            "scope": "block_range" if len(source["block_ids"]) > 1 else "block",
-            "ocr_used": source["ocr_used"],
-            "confirmed_by": reviewer.strip(), "confirmed_at": now(),
-            "confirmation_mode": "automated" if reviewer.startswith("model:") else "human",
-        })
+        additions.append(_build_evidence_record(job_id, page, source, quote, topic, group, split, reviewer.strip()))
     write_jsonl(p / "evidence/units.jsonl", records + additions)
     return additions
 
@@ -939,10 +1289,18 @@ def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[di
 def freeze_splits(job_id: str) -> dict:
     p = job_dir(job_id)
     if (p / "evidence/splits.json").exists():
-        return read_json(p / "evidence/splits.json")
-    evidence = evidence_for(job_id)
+        frozen = read_json(p / "evidence/splits.json")
+        if (not frozen or not (p / "evidence/units.jsonl").is_file()
+                or frozen.get("evidence_sha256") != sha256_file(p / "evidence/units.jsonl")
+                or any(not review_policy.source_verified(unit) for unit in current_evidence_units(job_id))):
+            raise ValueError("冻结证据与当前来源版本不一致，请显式迁移或建立新任务")
+        return frozen
+    evidence = current_evidence_units(job_id)
     if not evidence or {e["split"] for e in evidence} != SPLITS:
         raise ValueError("冻结前 train、validation、test 都必须有证据")
+    pending = [e["evidence_unit_id"] for e in evidence if not review_policy.source_verified(e)]
+    if pending:
+        raise ValueError(f"仍有 {len(pending)} 条证据未对照 PDF 核实，不能冻结")
     groups = {}
     for e in evidence:
         key = (e["doc_id"], e["clause_group"])
@@ -950,7 +1308,9 @@ def freeze_splits(job_id: str) -> dict:
             raise ValueError(f"同一章节/相邻条款组跨 split：{key}")
         groups[key] = e["split"]
     counts = {split: sum(e["split"] == split for e in evidence) for split in sorted(SPLITS)}
-    manifest = {"frozen_at": now(), "evidence_sha256": sha256_file(p / "evidence/units.jsonl"), "counts": counts, "groups": len(groups)}
+    manifest = {"frozen_at": now(), "evidence_sha256": sha256_file(p / "evidence/units.jsonl"),
+                "parse_version": extraction_quality.PARSE_VERSION,
+                "counts": counts, "groups": len(groups)}
     write_json(p / "evidence/splits.json", manifest)
     return manifest
 
@@ -959,7 +1319,7 @@ def candidates_for(job_id: str) -> list[dict]:
     return read_jsonl(job_dir(job_id) / "candidates/records.jsonl")
 
 
-def add_candidate(job_id: str, question: str, answer: str, evidence_ids: list[str], answerability: str, claim: str = "", origin: str = "manual", generator_model: str | None = None, prompt_version: str | None = None, generation_key: str | None = None) -> dict:
+def add_candidate(job_id: str, question: str, answer: str, evidence_ids: list[str], answerability: str, claim: str = "", origin: str = "manual", generator_model: str | None = None, prompt_version: str | None = None, generation_key: str | None = None, *, claims: list[dict] | None = None, schema_version: str | None = None) -> dict:
     p = job_dir(job_id)
     if not (p / "evidence/splits.json").exists():
         raise ValueError("必须先冻结证据分区")
@@ -978,7 +1338,32 @@ def add_candidate(job_id: str, question: str, answer: str, evidence_ids: list[st
     records = candidates_for(job_id)
     if generation_key and any(r.get("generation_key") == generation_key for r in records):
         raise ValueError("同一证据、提示词和变体的候选已存在")
-    record = {"sample_id": f"SFT-{uuid.uuid4().hex[:12]}", "split": next(iter(splits)), "task_type": "grounded_qa" if answerability == "answerable" else "unanswerable", "question": question.strip(), "answerability": answerability, "answer": answer.strip(), "claims": [{"claim_id": "C1", "text": claim.strip(), "support_type": "direct" if len(refs) == 1 else "multi_evidence_derived", "evidence_ids": [r["evidence_id"] for r in refs]}] if answerability == "answerable" else [], "evidence": refs, "origin": origin, "generator_model": generator_model, "prompt_version": prompt_version, "generation_key": generation_key, "review": {"status": "pending", "reviewer_id": None, "comment": ""}, "created_at": now()}
+    version = schema_version or ("qa-v2" if claims is not None else "qa-v1")
+    if version not in {"qa-v1", "qa-v2"}:
+        raise ValueError("未知问答结构版本")
+    claim_records = claims if claims is not None else ([{"claim_id": "C1", "text": claim.strip(),
+        "support_type": "direct" if len(refs) == 1 else "multi_evidence_derived",
+        "evidence_ids": [r["evidence_id"] for r in refs]}] if answerability == "answerable" else [])
+    if version == "qa-v2":
+        structure_errors = claim_validation.validate_claim_structure(
+            claim_records, answerability, refs,
+            review_policy.config(ROOT).get("max_claims_per_answer", 8))
+        if structure_errors:
+            raise ValueError("；".join(structure_errors))
+    coverage = (claim_validation.check_answer_coverage(answer, claim_records, answerability)
+                if version == "qa-v2" else {"status": "not_checked", "reason": "旧单断言记录待迁移"})
+    numeric = (numeric_validation.compare_numeric_facts(answer, "\n".join(ref["quote"] for ref in refs))
+               if version == "qa-v2" else {"status": "not_checked"})
+    record = {"sample_id": f"SFT-{uuid.uuid4().hex[:12]}", "split": next(iter(splits)),
+        "task_type": "grounded_qa" if answerability == "answerable" else "unanswerable",
+        "candidate_schema_version": version, "record_revision": 1,
+        "question": question.strip(), "answerability": answerability, "answer": answer.strip(),
+        "claims": claim_records, "coverage_check": coverage, "numeric_checks": numeric,
+        "judge_assessments": [], "evidence": refs, "origin": origin,
+        "generator_model": generator_model, "prompt_version": prompt_version,
+        "generation_key": generation_key,
+        "review": {"status": "pending", "reviewer_id": None, "comment": ""}, "created_at": now()}
+    record["claim_spans"] = claim_validation.resolve_claim_spans(answer, claim_records, refs)[0] if version == "qa-v2" else []
     errors = validate_candidate(record, units)
     if errors:
         raise ValueError("；".join(errors))
@@ -1017,9 +1402,12 @@ def validate_candidate(record: dict, units: dict[str, dict]) -> list[str]:
     if markers - allowed:
         errors.append("答案引用了不存在的证据编号")
     if record.get("answerability") == "answerable":
-        if not record.get("claims"):
+        if not isinstance(record.get("claims"), list) or not record.get("claims"):
             errors.append("有证据答案缺少 claim")
-        for claim in record.get("claims", []):
+        for claim in record.get("claims", []) if isinstance(record.get("claims"), list) else []:
+            if not isinstance(claim, dict):
+                errors.append("claim 格式无效")
+                continue
             if not claim.get("text") or claim.get("support_type") == "unsupported" or not claim.get("evidence_ids"):
                 errors.append("claim 内容或证据映射无效")
             if set(claim.get("evidence_ids", [])) - seen:
@@ -1027,13 +1415,47 @@ def validate_candidate(record: dict, units: dict[str, dict]) -> list[str]:
             if not {f"[{x}]" for x in claim.get("evidence_ids", [])} <= markers:
                 errors.append("claim 引用未在答案中出现")
     elif record.get("answerability") == "unanswerable":
-        if record.get("claims"):
+        if record.get("claims") and record.get("candidate_schema_version") != "qa-v2":
             errors.append("不可回答样本不能含正式 claim")
+        if record.get("candidate_schema_version") == "qa-v2":
+            for claim in record.get("claims", []) if isinstance(record.get("claims"), list) else []:
+                if isinstance(claim, dict) and not {f"[{x}]" for x in claim.get("evidence_ids", [])} <= markers:
+                    errors.append("拒答中的事实断言引用未在答案中出现")
         if "不足" not in record.get("answer", "") and "无法确认" not in record.get("answer", ""):
             errors.append("拒答答案必须说明证据不足或无法确认")
     else:
         errors.append("无效 answerability")
+    if record.get("candidate_schema_version") == "qa-v2":
+        structure_errors = claim_validation.validate_claim_structure(
+            record.get("claims", []), record.get("answerability"), refs,
+            review_policy.config(ROOT).get("max_claims_per_answer", 8))
+        errors.extend(structure_errors)
+        if not structure_errors:
+            resolved_spans, span_errors = claim_validation.resolve_claim_spans(
+                record.get("answer", ""), record.get("claims", []), refs)
+            errors.extend(span_errors)
+            if record.get("claim_spans") != resolved_spans:
+                errors.append("断言位置与答案或证据版本不一致")
     return list(dict.fromkeys(errors))
+
+
+def candidate_content_sha256(record: dict) -> str:
+    fields = {key: record.get(key) for key in ("sample_id", "record_revision", "question",
+        "answer", "answerability", "claims", "claim_spans", "evidence", "coverage_check", "numeric_checks")}
+    return extraction_quality.digest_text(json.dumps(fields, ensure_ascii=False, sort_keys=True))
+
+
+def candidate_source_sha256(record: dict, units: dict[str, dict]) -> str:
+    fields = [{"evidence_unit_id": ref["evidence_unit_id"],
+               "source_text_sha256": units[ref["evidence_unit_id"]].get("source_text_sha256"),
+               "source_pdf_sha256": units[ref["evidence_unit_id"]].get("source_pdf_sha256"),
+               "parse_version": units[ref["evidence_unit_id"]].get("parse_version"),
+               "source_fragments": units[ref["evidence_unit_id"]].get("source_fragments"),
+               "source_locations": units[ref["evidence_unit_id"]].get("source_locations"),
+               "quality_issue_ids": units[ref["evidence_unit_id"]].get("quality_issue_ids"),
+               "source_verification": units[ref["evidence_unit_id"]].get("source_verification")}
+              for ref in record["evidence"] if ref["evidence_unit_id"] in units]
+    return extraction_quality.digest_text(json.dumps(fields, ensure_ascii=False, sort_keys=True))
 
 
 def edit_candidate(job_id: str, sample_id: str, revised: dict, editor: str) -> dict:
@@ -1046,13 +1468,37 @@ def edit_candidate(job_id: str, sample_id: str, revised: dict, editor: str) -> d
         raise ValueError("样本不存在或 ID 不唯一")
     idx = matches[0]
     old = records[idx]
+    if revised.get("record_revision", old.get("record_revision", 1)) != old.get("record_revision", 1):
+        raise RevisionConflict("候选版本已变化，请刷新后重新编辑")
     protected = ("split", "origin", "generator_model", "prompt_version", "generation_key")
     if any(revised.get(field) != old.get(field) for field in protected):
         raise ValueError("split、候选来源和生成溯源字段不可通过编辑修改")
     units = {e["evidence_unit_id"]: e for e in evidence_for(job_id)}
+    if revised.get("candidate_schema_version") == "qa-v2":
+        structure_errors = claim_validation.validate_claim_structure(
+            revised.get("claims", []), revised.get("answerability"),
+            revised.get("evidence", []),
+            review_policy.config(ROOT).get("max_claims_per_answer", 8))
+        if structure_errors:
+            raise ValueError("编辑后仍有错误：" + "；".join(structure_errors))
+        revised["claim_spans"] = claim_validation.resolve_claim_spans(
+            revised.get("answer", ""), revised.get("claims", []), revised.get("evidence", []))[0]
     errors = validate_candidate(revised, units)
     if errors:
         raise ValueError("编辑后仍有错误：" + "；".join(errors))
+    revised["record_revision"] = old.get("record_revision", 1) + 1
+    if revised.get("candidate_schema_version") == "qa-v2":
+        revised["claim_spans"] = claim_validation.resolve_claim_spans(
+            revised["answer"], revised["claims"], revised["evidence"])[0]
+        revised["coverage_check"] = claim_validation.check_answer_coverage(
+            revised["answer"], revised["claims"], revised["answerability"])
+        revised["numeric_checks"] = numeric_validation.compare_numeric_facts(
+            revised["answer"], "\n".join(ref["quote"] for ref in revised["evidence"]))
+    else:
+        revised["claim_spans"] = []
+        revised["coverage_check"] = {"status": "not_checked"}
+        revised["numeric_checks"] = {"status": "not_checked"}
+    revised["judge_assessments"] = []
     revised["review"] = {"status": "pending", "reviewer_id": None, "comment": ""}
     revised["edited_at"] = now()
     append_jsonl(p / "reviewed/events.jsonl", {"sample_id": sample_id, "action": "edit", "editor": editor.strip(), "before": old, "after": revised, "at": now()})
@@ -1061,7 +1507,7 @@ def edit_candidate(job_id: str, sample_id: str, revised: dict, editor: str) -> d
     return revised
 
 
-def review_candidate(job_id: str, sample_id: str, decision: str, reviewer: str, comment: str = "", auto_assessment: dict | None = None) -> dict:
+def review_candidate(job_id: str, sample_id: str, decision: str, reviewer: str, comment: str = "", auto_assessment: dict | None = None, *, expected_revision: int | None = None, claim_reviews: list[dict] | None = None, source_reviews: list[dict] | None = None, numeric_review: dict | None = None) -> dict:
     if decision not in DECISIONS or not reviewer.strip():
         raise ValueError("请选择审核结论并填写审核人")
     p = job_dir(job_id)
@@ -1070,18 +1516,33 @@ def review_candidate(job_id: str, sample_id: str, decision: str, reviewer: str, 
     if len(matches) != 1:
         raise ValueError("样本不存在或 ID 不唯一")
     record = matches[0]
+    if type(expected_revision) is not int or expected_revision != record.get("record_revision", 1):
+        raise RevisionConflict("候选版本已变化，请刷新审核详情")
+    units = {e["evidence_unit_id"]: e for e in current_evidence_units(job_id)}
     if decision in {"approved", "approved_after_edit"}:
-        units = {e["evidence_unit_id"]: e for e in evidence_for(job_id)}
         errors = validate_candidate(record, units)
         if errors:
             raise ValueError("审核未通过：" + "；".join(errors))
+        gate = review_policy.evaluate_approval(record, units, auto_assessment,
+            review_policy.config(ROOT, job_id), automated=auto_assessment is not None,
+            claim_reviews=claim_reviews, source_reviews=source_reviews,
+            numeric_review=numeric_review)
+        if not gate["approved"]:
+            raise ValueError("审核未通过：" + "；".join(gate["reasons"]))
     before = record["review"].copy()
-    record["review"] = {"status": decision, "reviewer_id": reviewer.strip(), "comment": comment.strip(), "reviewed_at": now()}
+    record["review"] = {"status": decision, "reviewer_id": reviewer.strip(),
+        "reviewer": reviewer.strip(), "comment": comment.strip(), "reviewed_at": now(),
+        "reviewed_record_sha256": candidate_content_sha256(record),
+        "reviewed_source_sha256": candidate_source_sha256(record, units),
+        "review_policy_version": review_policy.POLICY_VERSION,
+        "claim_reviews": claim_reviews or [], "source_reviews": source_reviews or [],
+        "numeric_review": numeric_review}
     if auto_assessment is not None:
         if not reviewer.startswith("model:"):
             raise ValueError("自动审核记录必须注明模型")
         record["review"]["review_mode"] = "automated"
         record["review"]["assessment"] = auto_assessment
+        record.setdefault("judge_assessments", []).append(auto_assessment)
     append_jsonl(p / "reviewed/events.jsonl", {"sample_id": sample_id, "before": before, "after": record["review"], "at": now()})
     write_jsonl(p / "candidates/records.jsonl", records)
     return record
@@ -1089,7 +1550,11 @@ def review_candidate(job_id: str, sample_id: str, decision: str, reviewer: str, 
 
 def review_candidates_batch(
     job_id: str, sample_ids: list[str], reviewer: str,
-    decision: str = "approved", comment: str = "",
+    decision: str = "approved", comment: str = "", *,
+    expected_revisions: dict[str, int] | None = None,
+    claim_reviews: dict[str, list[dict]] | None = None,
+    source_reviews: dict[str, list[dict]] | None = None,
+    numeric_reviews: dict[str, dict] | None = None,
 ) -> dict:
     if decision not in {"approved", "rejected", "pending_expert_review"} or not reviewer.strip():
         raise ValueError("请选择批量审核结论并填写审核人")
@@ -1100,15 +1565,26 @@ def review_candidates_batch(
     by_id = {record["sample_id"]: record for record in records}
     if len(by_id) != len(records) or any(sample_id not in by_id for sample_id in sample_ids):
         raise ValueError("候选 ID 不存在或不唯一")
-    units = {item["evidence_unit_id"]: item for item in evidence_for(job_id)}
+    if not isinstance(expected_revisions, dict):
+        raise RevisionConflict("批量审核缺少候选版本，请刷新列表")
+    units = {item["evidence_unit_id"]: item for item in current_evidence_units(job_id)}
     for sample_id in sample_ids:
         record = by_id[sample_id]
+        if type(expected_revisions.get(sample_id)) is not int or expected_revisions[sample_id] != record.get("record_revision", 1):
+            raise RevisionConflict(f"{sample_id}：候选版本已变化")
         if record["review"]["status"] not in {"pending", "pending_expert_review"}:
             raise ValueError(f"{sample_id}：只能批量审核待审或待专家核对候选")
         if decision == "approved":
             errors = validate_candidate(record, units)
             if errors:
                 raise ValueError(f"{sample_id}：" + "；".join(errors))
+            gate = review_policy.evaluate_approval(record, units, None,
+                review_policy.config(ROOT, job_id), automated=False,
+                claim_reviews=(claim_reviews or {}).get(sample_id),
+                source_reviews=(source_reviews or {}).get(sample_id),
+                numeric_review=(numeric_reviews or {}).get(sample_id))
+            if not gate["approved"]:
+                raise ValueError(f"{sample_id}：" + "；".join(gate["reasons"]))
     batch_id = f"BR-{uuid.uuid4().hex[:12]}"
     timestamp = now()
     events = read_jsonl(p / "reviewed/events.jsonl")
@@ -1119,6 +1595,12 @@ def review_candidates_batch(
             "status": decision, "reviewer_id": reviewer.strip(),
             "comment": comment.strip(), "reviewed_at": timestamp,
             "review_mode": "batch", "batch_id": batch_id,
+            "reviewed_record_sha256": candidate_content_sha256(record),
+            "reviewed_source_sha256": candidate_source_sha256(record, units),
+            "review_policy_version": review_policy.POLICY_VERSION,
+            "claim_reviews": (claim_reviews or {}).get(sample_id, []),
+            "source_reviews": (source_reviews or {}).get(sample_id, []),
+            "numeric_review": (numeric_reviews or {}).get(sample_id),
         }
         events.append({
             "sample_id": sample_id, "before": before,
@@ -1131,7 +1613,7 @@ def review_candidates_batch(
 
 def quality_report(job_id: str) -> dict:
     meta = load_job(job_id)
-    evidence = evidence_for(job_id)
+    evidence = current_evidence_units(job_id)
     records = candidates_for(job_id)
     approved = [r for r in records if r["review"]["status"] in {"approved", "approved_after_edit"}]
     document_count = len(meta["documents"])
@@ -1139,8 +1621,16 @@ def quality_report(job_id: str) -> dict:
     approved_target = 90 * document_count
     holdout_evidence_target = 4 * document_count
     issues = []
+    source_issues = []
+    semantic_issues = []
+    for issue in read_jsonl(job_dir(job_id) / "parsed/issues.jsonl"):
+        if (issue.get("severity") in {"warning", "blocker"}
+                and issue.get("status") not in {"已核实", "已排除"}):
+            source_issues.append(f"{issue['issue_id']} PDF 第 {issue['pdf_page']} 页提取问题尚未解决")
     if not document_count:
         issues.append("请至少上传一份 PDF")
+    if pages_for(job_id) and not txt_is_current(job_id):
+        issues.append("整理 TXT 与当前解析或问题版本不一致")
     if len(evidence) < evidence_target:
         issues.append(f"可追溯证据单元不足 {evidence_target}")
     for document in meta["documents"]:
@@ -1154,6 +1644,10 @@ def quality_report(job_id: str) -> dict:
         issues.append("冻结后证据内容发生变化")
     if len({e["evidence_unit_id"] for e in evidence}) != len(evidence):
         issues.append("证据单元 ID 不唯一")
+    for unit in evidence:
+        if not review_policy.source_verified(unit):
+            details = "；".join(unit.get("unresolved_blockers", [])) or "来源尚未对照 PDF 核实"
+            source_issues.append(f"{unit['evidence_unit_id']} {details}")
     if len({r["sample_id"] for r in records}) != len(records):
         issues.append("样本 ID 不唯一")
     if len(approved) < approved_target:
@@ -1177,14 +1671,27 @@ def quality_report(job_id: str) -> dict:
             expected_recipe = {key: generation_config.get(key) for key in (
                 "model_id", "model_revision", "prompt_version", "temperature", "max_tokens"
             )}
+            expected_recipe["candidate_schema_version"] = "qa-v2"
             prompt_path = ROOT / generation_config.get("prompt_file", "")
             expected_recipe["prompt_sha256"] = sha256_file(prompt_path) if prompt_path.is_file() else None
             if fingerprint != expected_recipe:
                 issues.append("当前生成配方与测试集冻结配方不一致")
     units = {e["evidence_unit_id"]: e for e in evidence}
+    active_review_policy = review_policy.config(ROOT, job_id)
     for record in approved:
         for err in validate_candidate(record, units):
             issues.append(f"{record['sample_id']}: {err}")
+        review = record.get("review", {})
+        gate = review_policy.evaluate_approval(record, units, review.get("assessment"),
+            active_review_policy,
+            automated=review.get("review_mode") == "automated",
+            claim_reviews=review.get("claim_reviews"),
+            source_reviews=review.get("source_reviews"),
+            numeric_review=review.get("numeric_review"))
+        semantic_issues.extend(f"{record['sample_id']} {reason}" for reason in gate["reasons"])
+        if (review.get("reviewed_record_sha256") != candidate_content_sha256(record)
+                or review.get("reviewed_source_sha256") != candidate_source_sha256(record, units)):
+            semantic_issues.append(f"{record['sample_id']} 审核记录与当前内容或来源版本不一致")
     approved_by_document = {}
     approved_evidence_units_by_document = {}
     for document in meta["documents"]:
@@ -1225,11 +1732,85 @@ def quality_report(job_id: str) -> dict:
         issues.append(f"跨分区重复获批问题 {repeated_questions} 处")
     review_modes = {mode: sum(r["review"].get("review_mode", "human") == mode for r in approved)
                     for mode in ("automated", "batch", "human")}
-    return {"documents": document_count, "evidence_units": len(evidence), "evidence_target": evidence_target, "approved_target": approved_target, "holdout_evidence_target": holdout_evidence_target, "candidates": len(records), "approved": len(approved), "approved_by_split": split_counts, "approved_by_document": approved_by_document, "approved_evidence_units_by_document": approved_evidence_units_by_document, "approved_by_review_mode": review_modes, "semantic_validation": "not_independently_validated", "issues": issues, "final_ready": not issues}
+    structural_ready = not issues
+    source_ready = not source_issues
+    semantic_ready = not semantic_issues
+    return {"documents": document_count, "evidence_units": len(evidence),
+        "evidence_target": evidence_target, "approved_target": approved_target,
+        "holdout_evidence_target": holdout_evidence_target, "candidates": len(records),
+        "approved": len(approved), "approved_by_split": split_counts,
+        "approved_by_document": approved_by_document,
+        "approved_evidence_units_by_document": approved_evidence_units_by_document,
+        "approved_by_review_mode": review_modes,
+        "structural_ready": structural_ready, "source_verified": source_ready,
+        "semantic_reviewed": semantic_ready,
+        "semantic_validation": "policy_reviewed" if semantic_ready and approved else "not_independently_validated",
+        "source_issues": source_issues, "semantic_issues": semantic_issues,
+        "issues": issues + source_issues + semantic_issues,
+        "final_ready": structural_ready and source_ready and semantic_ready}
 
 
 def _jsonl_bytes(records: list[dict]) -> bytes:
     return "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in records).encode("utf-8")
+
+
+def export_state_sha256(job_id: str) -> str:
+    from aviation_ft import providers
+    names = ("configs/settings.json", "configs/quality.json", "configs/generation.json",
+             "configs/review.json", "prompts/generate_grounded_qa.md",
+             "prompts/judge_grounded_qa.md", "prompts/judge_unanswerable_qa.md")
+    state = {name: sha256_file(ROOT / name) if (ROOT / name).is_file() else None for name in names}
+    state["provider_roles"] = {role: providers.public_config(job_id, role)
+                               for role in ("generator", "judge_primary", "judge_countercheck")}
+    return extraction_quality.config_hash(state)
+
+
+def export_is_current(job_id: str, artifact: Path) -> bool:
+    if not artifact.is_file():
+        return False
+    sidecar = read_json(artifact.with_suffix(".sha256.json"), {})
+    if sidecar.get("status") == "historical_snapshot":
+        return False
+    root = job_dir(job_id)
+    for key, relative in (("candidates_sha256", "candidates/records.jsonl"),
+                          ("evidence_sha256", "evidence/units.jsonl"),
+                          ("pages_sha256", "parsed/pages.jsonl"),
+                          ("issues_sha256", "parsed/issues.jsonl"),
+                          ("cross_page_decisions_sha256", "parsed/cross_page_decisions.jsonl"),
+                          ("txt_report_sha256", "parsed/txt_report.json"),
+                          ("review_events_sha256", "reviewed/events.jsonl"),
+                          ("verification_events_sha256", "evidence/verification_events.jsonl")):
+        path = root / relative
+        if sidecar.get(key) != (sha256_file(path) if path.is_file() else None):
+            return False
+    if (sidecar.get("sha256") != sha256_file(artifact)
+            or sidecar.get("state_sha256") != export_state_sha256(job_id)):
+        return False
+    documents = load_job(job_id)["documents"]
+    if sidecar.get("pdf_sha256") != {d["doc_id"]: d["sha256"] for d in documents}:
+        return False
+    return all((root / "raw_pdf" / d["filename"]).is_file()
+               and sha256_file(root / "raw_pdf" / d["filename"]) == d["sha256"]
+               for d in documents)
+
+
+def _preserve_export_snapshot(artifact: Path) -> None:
+    """Keep a prior fixed-name export as an explicitly historical local snapshot."""
+    if not artifact.is_file():
+        return
+    history = artifact.parent / "history"
+    history.mkdir(exist_ok=True)
+    old_sha = sha256_file(artifact)
+    archived = history / f"{artifact.stem}-{old_sha[:16]}.zip"
+    if not archived.exists():
+        shutil.copy2(artifact, archived)
+    sidecar = artifact.with_suffix(".sha256.json")
+    metadata = read_json(sidecar, {})
+    history_sidecar = archived.with_suffix(".sha256.json")
+    if not history_sidecar.exists():
+        write_json(history_sidecar, {
+            **metadata, "filename": archived.name, "sha256": old_sha,
+            "status": "historical_snapshot", "superseded_at": now()})
 
 
 def export_job(job_id: str, final: bool = False, *, include_audit: bool = False) -> tuple[Path, str, dict]:
@@ -1254,7 +1835,7 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
     def training_record(r):
         prompt = "\n".join(f"[{ref['evidence_id']}] {ref['quote']}" for ref in r["evidence"])
         return {"messages": [{"role": "system", "content": "只能依据给定证据回答；每个关键结论须引用证据编号；证据不足须说明边界。"}, {"role": "user", "content": f"证据：\n{prompt}\n\n问题：{r['question']}"}, {"role": "assistant", "content": r["answer"]}], "metadata": {"sample_id": r["sample_id"], "evidence_unit_ids": [x["evidence_unit_id"] for x in r["evidence"]], "answerability": r["answerability"], "origin": r["origin"]}}
-    card = {"status": "final" if final else "preview_not_for_training", "generated_at": now(), "job_id": job_id, "source_job_id": meta.get("source_job_id"), "quality_report": report, "documents": [{k: d[k] for k in ("doc_id", "filename", "sha256", "pages")} for d in meta["documents"]], "model_location": settings()["generator_model_dir"] if provider["mode"] == "local" else None, "model_provider": provider_audit, "semantic_validation": report["semantic_validation"], "note": "原始 PDF 不在包内。正式包仅表示结构、数量、覆盖与引用门槛达标；生成与核验使用同一模型，语义质量未经独立验证。训练前应抽样验收。预览包不得用于训练。"}
+    card = {"status": "final" if final else "preview_not_for_training", "generated_at": now(), "job_id": job_id, "source_job_id": meta.get("source_job_id"), "quality_report": report, "documents": [{k: d[k] for k in ("doc_id", "filename", "sha256", "pages")} for d in meta["documents"]], "parse_versions": sorted({page.get("parse_version", "legacy") for page in pages_for(job_id)}), "model_location": settings()["generator_model_dir"] if provider["mode"] == "local" else None, "model_provider": provider_audit, "semantic_validation": report["semantic_validation"], "auto_approval_enabled": review_policy.config(ROOT, job_id).get("auto_approve_enabled", False), "note": "原始 PDF 不在包内。正式包表示当前结构、来源与审核策略门槛达标，不代表真实准确率已经验证。训练前须在独立人工标注集验收。预览包不得用于训练。"}
     kind = "final" if final else "preview"
     target = p / "exports" / f"aviation-sft-{kind}.zip"
     trace_target = p / "exports" / f"aviation-sft-{kind}-trace.zip"
@@ -1282,6 +1863,14 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
         contents["review_events.jsonl"] = (p / "reviewed/events.jsonl").read_bytes() if (p / "reviewed/events.jsonl").exists() else b""
         contents["generation_attempts.jsonl"] = (p / "candidates/generation_attempts.jsonl").read_bytes() if (p / "candidates/generation_attempts.jsonl").exists() else b""
         for archive_name, relative_path in (
+            ("parsed_pages.jsonl", "parsed/pages.jsonl"),
+            ("extraction_candidates.jsonl", "parsed/extraction_candidates.jsonl"),
+            ("page_quality.jsonl", "parsed/page_quality.jsonl"),
+            ("quality_issues.jsonl", "parsed/issues.jsonl"),
+            ("quality_issue_events.jsonl", "parsed/issue_events.jsonl"),
+            ("readable_units.jsonl", "parsed/readable_units.jsonl"),
+            ("txt_report.json", "parsed/txt_report.json"),
+            ("evidence_verification_events.jsonl", "evidence/verification_events.jsonl"),
             ("evidence_auto_assessments.jsonl", "evidence/auto_assessments.jsonl"),
             ("evidence_human_queue.jsonl", "evidence/human_queue.jsonl"),
             ("automation_progress.jsonl", "automation/progress.jsonl"),
@@ -1311,6 +1900,7 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
             with zipfile.ZipFile(trace_tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 for name, data in sorted(contents.items()):
                     archive.writestr(name, data)
+            _preserve_export_snapshot(trace_target)
             os.replace(trace_tmp, trace_target)
         finally:
             if os.path.exists(trace_tmp):
@@ -1319,6 +1909,7 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for name, data in sorted(contents.items()):
                 z.writestr(name, data)
+        _preserve_export_snapshot(target)
         os.replace(tmp, target)
     finally:
         if os.path.exists(tmp):
@@ -1332,11 +1923,34 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
             "status": card["status"], "bundle": bundle,
             "candidates_sha256": sha256_file(p / "candidates/records.jsonl") if (p / "candidates/records.jsonl").exists() else None,
             "evidence_sha256": sha256_file(p / "evidence/units.jsonl") if (p / "evidence/units.jsonl").exists() else None,
+            "pages_sha256": sha256_file(p / "parsed/pages.jsonl") if (p / "parsed/pages.jsonl").exists() else None,
+            "issues_sha256": sha256_file(p / "parsed/issues.jsonl") if (p / "parsed/issues.jsonl").exists() else None,
+            "cross_page_decisions_sha256": sha256_file(p / "parsed/cross_page_decisions.jsonl") if (p / "parsed/cross_page_decisions.jsonl").exists() else None,
+            "txt_report_sha256": sha256_file(p / "parsed/txt_report.json") if (p / "parsed/txt_report.json").exists() else None,
+            "review_events_sha256": sha256_file(p / "reviewed/events.jsonl") if (p / "reviewed/events.jsonl").exists() else None,
+            "verification_events_sha256": sha256_file(p / "evidence/verification_events.jsonl") if (p / "evidence/verification_events.jsonl").exists() else None,
+            "pdf_sha256": {d["doc_id"]: d["sha256"] for d in meta["documents"]},
+            "state_sha256": export_state_sha256(job_id),
         })
     meta["status"] = "final_exported" if final else "preview_exported"
     meta["last_export_at"] = now()
     write_json(p / "job.json", meta)
     return (trace_target, digests["trace"], report) if include_audit else (target, digests["training"], report)
+
+
+def _remove_job_tree(path: Path) -> None:
+    """Windows marks the immutable uploaded PDFs read-only; explicit deletion clears it."""
+    def clear_readonly(func, name, error):
+        os.chmod(name, stat.S_IWRITE | stat.S_IREAD)
+        func(name)
+    shutil.rmtree(path, onerror=clear_readonly)
+
+
+def _remove_provider_secrets(job_id: str) -> None:
+    for role in ("", ".judge_primary", ".judge_countercheck"):
+        secret = ROOT / "runtime/provider_secrets" / f"{job_id}{role}.json"
+        if secret.is_file() and not secret.is_symlink():
+            secret.unlink()
 
 
 def delete_job(job_id: str, confirmation: str) -> dict:
@@ -1352,10 +1966,8 @@ def delete_job(job_id: str, confirmation: str) -> dict:
         "reason": "manual_task_delete",
         "documents": len(meta.get("documents", [])),
     }
-    secret = ROOT / "runtime/provider_secrets" / f"{job_id}.json"
-    if secret.is_file() and not secret.is_symlink():
-        secret.unlink()
-    shutil.rmtree(p)
+    _remove_provider_secrets(job_id)
+    _remove_job_tree(p)
     append_jsonl(ROOT / "runtime/cleanup_log.jsonl", audit)
     return audit
 
@@ -1368,7 +1980,8 @@ def cleanup_job(job_id: str, confirmation: str, expected_sha256: str, reason: st
     if not exports or expected_sha256 not in {read_json(x)["sha256"] for x in exports}:
         raise ValueError("请先下载数据包，并提供其 SHA-256 确认")
     meta = load_job(job_id)
-    shutil.rmtree(p)
+    _remove_provider_secrets(job_id)
+    _remove_job_tree(p)
     append_jsonl(ROOT / "runtime/cleanup_log.jsonl", {"job_id": job_id, "label": meta["label"], "at": now(), "reason": reason, "export_sha256": expected_sha256})
 
 

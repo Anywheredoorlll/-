@@ -219,13 +219,7 @@ if progress["approved"] >= quality["approved_target"] and not quality["final_rea
     st.error("正式数据包未达标：" + "；".join(quality["issues"][:5]))
 if meta["status"] == "preview_exported":
     preview_path = core.job_dir(job_id) / "exports/aviation-sft-preview.zip"
-    preview_meta = core.read_json(preview_path.with_suffix(".sha256.json"), {})
-    candidates_path = core.job_dir(job_id) / "candidates/records.jsonl"
-    evidence_path = core.job_dir(job_id) / "evidence/units.jsonl"
-    if preview_path.exists() and (
-        preview_meta.get("candidates_sha256") != (core.sha256_file(candidates_path) if candidates_path.exists() else None)
-        or preview_meta.get("evidence_sha256") != (core.sha256_file(evidence_path) if evidence_path.exists() else None)
-    ):
+    if preview_path.exists() and not core.export_is_current(job_id, preview_path):
         st.warning("现有预览 ZIP 已过期，不包含最新审核结果；请在导出页重新生成。预览包不能用于训练。")
 
 t_upload, t_evidence, t_candidates, t_export = st.tabs(["① 上传", "② 原文异常/手动", "③ 问答异常/手动", "④ 结果下载与清理"])
@@ -615,6 +609,19 @@ with t_evidence:
             st.markdown("#### 已确认的证据")
             st.caption("在这里做最终覆盖检查并冻结分区。冻结后不能再增补或修改证据。")
             if existing_units:
+                drafts = [item for item in existing_units
+                          if item.get("source_verification", {}).get("status") != "source_verified"]
+                if drafts and not frozen_evidence:
+                    with st.form("source-verification-form"):
+                        selected_source = st.selectbox("待核实证据", [item["evidence_unit_id"] for item in drafts])
+                        source_reviewer = st.text_input("PDF 核对人 ID")
+                        source_reason = st.text_area("对照 PDF 的页码、文字或表格单元格及依据")
+                        verify_submitted = st.form_submit_button("记录来源核实")
+                    if verify_submitted:
+                        result = action(core.verify_evidence_source, job_id, selected_source,
+                                        source_reviewer, source_reason)
+                        if result:
+                            st.rerun()
                 st.dataframe(
                     [
                         {
@@ -731,7 +738,7 @@ with t_candidates:
             selected_review_ids = [row["sample_id"] for row in review_items if row["selected"]]
             st.caption(f"本页 {review_page}/{total_pages}；已选 {len(selected_review_ids)} 条。结构校验只检查引用和字段，答案语义仍需核对。")
             batch_decision = st.selectbox(
-                "批量审核结论", ["approved", "pending_expert_review", "rejected"],
+                "批量审核结论", ["pending_expert_review", "rejected"],
                 key=f"review-decision-{job_id}",
             )
             batch_reviewer_id = st.text_input("批量审核人 ID", key=f"reviewer-{job_id}")
@@ -747,6 +754,8 @@ with t_candidates:
                 result = action(
                     core.review_candidates_batch, job_id, selected_review_ids,
                     batch_reviewer_id, batch_decision, batch_comment,
+                    expected_revisions={r["sample_id"]: r.get("record_revision", 1)
+                                        for r in core.candidates_for(job_id) if r["sample_id"] in selected_review_ids},
                 )
                 if result:
                     st.json(result)
@@ -775,10 +784,16 @@ with t_candidates:
                 question = st.text_area("问题")
                 answerability = st.selectbox("可回答状态", ["answerable", "unanswerable"])
                 claim = st.text_area("原子化关键结论；不可回答时留空")
+                claims_json = st.text_area("qa-v2 断言 JSON 数组（每项含 answer_quote、evidence_ids、supporting_quotes）", value="[]")
                 answer = st.text_area("答案；可回答时使用 [E1] 等引用，拒答时明确证据不足")
                 submitted = st.form_submit_button("保存为未审核候选")
             if submitted:
-                action(core.add_candidate, job_id, question, answer, chosen, answerability, claim)
+                try:
+                    parsed_claims = json.loads(claims_json)
+                    action(core.add_candidate, job_id, question, answer, chosen, answerability,
+                           claim, claims=parsed_claims, schema_version="qa-v2")
+                except ValueError as exc:
+                    st.error(str(exc))
             records = core.candidates_for(job_id)
             if records:
                 statuses = {r["review"]["status"] for r in records}
@@ -806,9 +821,29 @@ with t_candidates:
                         reviewer = st.text_input("审核人 ID")
                         decision = st.selectbox("审核决定", ["approved", "regenerate", "rejected", "pending_expert_review"])
                         comment = st.text_area("审核说明 / 问题")
+                        claim_checks = [st.checkbox(f"已核对断言 {c['claim_id']}：{c['text'][:80]}",
+                                                    key=f"claim-check-{sample_id}-{c['claim_id']}")
+                                        for c in record.get("claims", [])]
+                        source_checks = [st.checkbox(f"已对照 PDF 来源 {ref['evidence_unit_id']}",
+                                                     key=f"source-check-{sample_id}-{ref['evidence_unit_id']}")
+                                         for ref in record.get("evidence", [])]
+                        numeric_facts = record.get("numeric_checks", {}).get("answer_facts", [])
+                        numeric_checks = [st.checkbox(f"已核实数值 {index + 1}：{fact['value']}{fact['unit']}",
+                                                      key=f"numeric-check-{sample_id}-{index}")
+                                          for index, fact in enumerate(numeric_facts)] if record.get("numeric_checks", {}).get("status") == "needs_human" else []
+                        numeric_reason = st.text_input("数值关系人工核对依据（主体、属性、关系、条件）") if record.get("numeric_checks", {}).get("status") == "needs_human" else ""
                         reviewed = st.form_submit_button("提交审核记录")
                     if reviewed:
-                        action(core.review_candidate, job_id, sample_id, decision, reviewer, comment)
+                        action(core.review_candidate, job_id, sample_id, decision, reviewer, comment,
+                               expected_revision=record.get("record_revision", 1),
+                               claim_reviews=[{"claim_id": c["claim_id"], "verdict": "supported"}
+                                              for c, checked in zip(record.get("claims", []), claim_checks) if checked],
+                               source_reviews=[{"evidence_unit_id": ref["evidence_unit_id"], "verified": True}
+                                               for ref, checked in zip(record.get("evidence", []), source_checks) if checked],
+                               numeric_review={"verdict": "verified", "reason": numeric_reason,
+                                               "fact_reviews": [{"index": i, "verdict": "supported"}
+                                                                for i, checked in enumerate(numeric_checks) if checked]}
+                                              if numeric_reason else None)
 
 with t_export:
     st.subheader("质量门槛与本地下载")
@@ -816,7 +851,7 @@ with t_export:
     state_title = "结构门槛已达标" if report["final_ready"] else "结构门槛待完成"
     state_detail = "可导出审计包；语义质量仍需独立抽样验收。" if report["final_ready"] else f"还有 {len(report['issues'])} 项需要解决，预览包不能用于训练。"
     st.markdown(f'<div class="aviation-card"><h3>{state_title}</h3><p>{state_detail}</p></div>', unsafe_allow_html=True)
-    st.caption("当前模型同时负责生成与双重核验，0.90 是模型自报值，不能当作真实准确率。")
+    st.caption("生成、主评审和反例评审使用独立角色；模型自报置信度不能当作真实准确率，自动通过默认关闭。")
     if report["approved_by_document"]:
         st.dataframe([{"文档": name, "获批问答": count, "被引用证据": report["approved_evidence_units_by_document"][name]} for name, count in report["approved_by_document"].items()], hide_index=True, width="stretch")
     if report["issues"]:
@@ -834,10 +869,7 @@ with t_export:
         path = core.job_dir(job_id) / "exports" / f"aviation-sft-{kind}.zip"
         if path.exists():
             digest = core.sha256_file(path)
-            sidecar = core.read_json(path.with_suffix(".sha256.json"), {})
-            candidate_path = core.job_dir(job_id) / "candidates/records.jsonl"
-            evidence_path = core.job_dir(job_id) / "evidence/units.jsonl"
-            stale = sidecar.get("candidates_sha256") != (core.sha256_file(candidate_path) if candidate_path.exists() else None) or sidecar.get("evidence_sha256") != (core.sha256_file(evidence_path) if evidence_path.exists() else None)
+            stale = not core.export_is_current(job_id, path)
             st.write(f"{path.name} · SHA-256 `{digest}`")
             if stale:
                 st.warning("此包生成后候选或证据发生变化，请重新导出。")

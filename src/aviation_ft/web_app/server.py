@@ -10,10 +10,12 @@ from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from aviation_ft import core, generation, providers, workflow
+import pymupdf as fitz
 
 STATIC_DIR = Path(__file__).with_name("static")
 
@@ -58,23 +60,27 @@ async def dashboard(request: Request) -> JSONResponse:
         "provider": providers.public_config(job_id),
         "provider_presets": providers.provider_presets(),
         "exports": {
-            kind: {"ready": path.is_file(), "size_bytes": path.stat().st_size if path.is_file() else 0}
+            kind: {"ready": core.export_is_current(job_id, path) if path.is_file() else False,
+                   "historical_snapshot": path.is_file() and not core.export_is_current(job_id, path),
+                   "size_bytes": path.stat().st_size if path.is_file() else 0}
             for kind in ("preview", "final", "preview-trace", "final-trace")
             for path in [core.job_dir(job_id) / "exports" / f"aviation-sft-{kind}.zip"]
         },
         "semantic_txt": {
-            "ready": txt_path.is_file(),
+            "ready": txt_path.is_file() and core.txt_is_current(job_id),
             "size_bytes": txt_path.stat().st_size if txt_path.is_file() else 0,
         },
+        "page_quality": core.read_jsonl(core.job_dir(job_id) / "parsed/page_quality.jsonl"),
     })
 
 
 async def provider_config(request: Request) -> JSONResponse:
     job_id = request.path_params["job_id"]
+    role = request.query_params.get("role", "generator")
     if request.method == "GET":
-        return response(providers.public_config(job_id))
+        return response(providers.public_config(job_id, role))
     if request.method == "DELETE":
-        return response(providers.use_local(job_id))
+        return response(providers.use_local(job_id, role))
     payload = await request.json()
     result = providers.save_external(
         job_id,
@@ -83,17 +89,19 @@ async def provider_config(request: Request) -> JSONResponse:
         str(payload.get("api_key", "")),
         bool(payload.get("privacy_acknowledged", False)),
         str(payload.get("preset_id", "")),
+        role,
     )
     return response(result)
 
 
 async def test_provider(request: Request) -> JSONResponse:
     job_id = request.path_params["job_id"]
-    result = await run_in_threadpool(generation.probe, job_id)
+    role = request.query_params.get("role", "generator")
+    result = await run_in_threadpool(generation.probe, job_id, role)
     return response({
         "ready": result["ready"],
         "model": result["served_model_name"],
-        "mode": providers.public_config(job_id)["mode"],
+        "mode": providers.public_config(job_id, role)["mode"], "role": role,
     })
 
 
@@ -148,6 +156,8 @@ async def evidence_overview(request: Request) -> JSONResponse:
             "ocr_used": bool(page.get("ocr_used")),
             "possible_scanned": bool(page.get("possible_scanned")),
             "blocks": len(page.get("blocks", [])),
+            "quality_status": page.get("quality_status", "legacy_unknown"),
+            "quality_issue_ids": page.get("quality_issue_ids", []),
         }
         for page in pages
     ]
@@ -156,6 +166,7 @@ async def evidence_overview(request: Request) -> JSONResponse:
         "units": units,
         "pages": page_index,
         "frozen": (core.job_dir(job_id) / "evidence/splits.json").exists(),
+        "quality_issues": core.read_jsonl(core.job_dir(job_id) / "parsed/issues.jsonl"),
     })
 
 
@@ -181,7 +192,7 @@ async def page_detail(request: Request) -> JSONResponse:
     result["semantic_blocks"] = [
         unit for unit in core.semantic_blocks_for_document([
             page for page in pages if page["doc_id"] == doc_id
-        ])
+        ], core.confirmed_merge_pairs(job_id))
         if unit["pdf_page"] <= page_no <= unit["end_pdf_page"]
     ]
     return response(result)
@@ -195,7 +206,7 @@ async def source_pdf(request: Request) -> FileResponse:
     if not document:
         raise ValueError("文档不存在")
     path = core.job_dir(job_id) / "raw_pdf" / document["filename"]
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink() or not path.is_file() or core.sha256_file(path) != document["sha256"]:
         raise ValueError("原始 PDF 不可用")
     return FileResponse(path, media_type="application/pdf")
 
@@ -231,14 +242,58 @@ async def add_evidence_batch(request: Request) -> JSONResponse:
     return response({"saved": len(saved)}, 201)
 
 
+async def cross_page_proposals(request: Request) -> JSONResponse:
+    return response(core.cross_page_merge_proposals(request.path_params["job_id"]))
+
+
+async def confirm_cross_page(request: Request) -> JSONResponse:
+    payload = await request.json()
+    return response(core.add_evidence_cross_page(
+        request.path_params["job_id"], str(payload.get("start_semantic_id", "")),
+        str(payload.get("end_semantic_id", "")), str(payload.get("topic", "")),
+        str(payload.get("clause_group", "")), str(payload.get("split", "")),
+        str(payload.get("reviewer", "")), str(payload.get("reason", "")),
+        str(payload.get("quote", "")) or None), 201)
+
+
 async def freeze_evidence(request: Request) -> JSONResponse:
     return response(core.freeze_splits(request.path_params["job_id"]))
 
 
+async def verify_evidence(request: Request) -> JSONResponse:
+    payload = await request.json()
+    return response(core.verify_evidence_source(request.path_params["job_id"],
+        request.path_params["evidence_unit_id"], str(payload.get("reviewer", "")),
+        str(payload.get("reason", ""))))
+
+
+async def resolve_issue(request: Request) -> JSONResponse:
+    payload = await request.json()
+    return response(core.resolve_quality_issue(request.path_params["job_id"],
+        request.path_params["issue_id"], str(payload.get("status", "")),
+        str(payload.get("reviewer", "")), str(payload.get("reason", ""))))
+
+
 async def candidates(request: Request) -> JSONResponse:
     job_id = request.path_params["job_id"]
-    units = core.evidence_for(job_id)
-    queue = workflow.review_queue(core.candidates_for(job_id), units)
+    try:
+        page = max(1, int(request.query_params.get("page", "1")))
+        page_size = int(request.query_params.get("page_size", "25"))
+    except ValueError as exc:
+        raise ValueError("分页参数无效") from exc
+    if not 1 <= page_size <= 100:
+        raise ValueError("每页只能显示 1 至 100 条")
+    units = core.current_evidence_units(job_id)
+    queue = workflow.review_queue(core.candidates_for(job_id), units, include_all=True)
+    status = request.query_params.get("status", "all")
+    doc_id = request.query_params.get("doc_id", "")
+    risk = request.query_params.get("risk", "")
+    queue = [item for item in queue
+             if (status == "all" or item["record"]["review"]["status"] == status)
+             and (not doc_id or any(ref["doc_id"] == doc_id for ref in item["record"]["evidence"]))
+             and (not risk or risk in item["flags"])]
+    total = len(queue)
+    queue = queue[(page - 1) * page_size:page * page_size]
     items = []
     for item in queue:
         record = item["record"]
@@ -251,22 +306,101 @@ async def candidates(request: Request) -> JSONResponse:
             "review_status": record["review"]["status"],
             "flags": item["flags"],
             "errors": item["errors"],
+            "record_revision": record.get("record_revision", 1),
             "evidence": [ref.get("quote", "") for ref in record.get("evidence", [])],
         })
-    return response({"items": items, "total": len(items)})
+    return response({"items": items, "total": total, "page": page, "page_size": page_size})
+
+
+async def candidate_detail(request: Request) -> JSONResponse:
+    job_id = request.path_params["job_id"]
+    sample_id = request.path_params["sample_id"]
+    record = next((r for r in core.candidates_for(job_id) if r["sample_id"] == sample_id), None)
+    if not record:
+        raise ValueError("候选不存在")
+    units = {u["evidence_unit_id"]: u for u in core.current_evidence_units(job_id)}
+    item = next(x for x in workflow.review_queue([record], list(units.values()), include_all=True))
+    return response({**record, "validation_errors": item["errors"],
+        "quality_flags": item["flags"],
+        "review_history": [event for event in core.read_jsonl(core.job_dir(job_id) / "reviewed/events.jsonl")
+                           if event.get("sample_id") == sample_id],
+        "source_units": [units.get(ref["evidence_unit_id"]) for ref in record["evidence"]]})
+
+
+async def review_one(request: Request) -> JSONResponse:
+    payload = await request.json()
+    if type(payload.get("expected_revision")) is not int:
+        raise ValueError("审核请求缺少候选版本 expected_revision")
+    return response(core.review_candidate(request.path_params["job_id"],
+        request.path_params["sample_id"], str(payload.get("decision", "")),
+        str(payload.get("reviewer", "")), str(payload.get("comment", "")),
+        expected_revision=payload.get("expected_revision"),
+        claim_reviews=payload.get("claim_reviews"), source_reviews=payload.get("source_reviews"),
+        numeric_review=payload.get("numeric_review")))
 
 
 async def review_batch(request: Request) -> JSONResponse:
     job_id = request.path_params["job_id"]
     payload = await request.json()
+    if not isinstance(payload.get("expected_revisions"), dict):
+        raise ValueError("批量审核请求缺少各候选 expected_revisions")
     result = core.review_candidates_batch(
         job_id,
         list(payload.get("sample_ids", [])),
         str(payload.get("reviewer", "")),
         str(payload.get("decision", "approved")),
         str(payload.get("comment", "")),
+        expected_revisions=payload.get("expected_revisions"),
+        claim_reviews=payload.get("claim_reviews"), source_reviews=payload.get("source_reviews"),
+        numeric_reviews=payload.get("numeric_reviews"),
     )
     return response(result)
+
+
+async def page_image(request: Request) -> Response:
+    job_id = request.path_params["job_id"]
+    doc_id = request.path_params["doc_id"]
+    page_no = int(request.path_params["page_no"])
+    document = next((d for d in core.load_job(job_id)["documents"] if d["doc_id"] == doc_id), None)
+    if not document:
+        raise ValueError("文档不存在")
+    path = core.job_dir(job_id) / "raw_pdf" / document["filename"]
+    if core.sha256_file(path) != document["sha256"]:
+        raise ValueError("原始 PDF 哈希不符")
+    with fitz.open(path) as pdf:
+        if not 1 <= page_no <= len(pdf):
+            raise ValueError("PDF 页码无效")
+        pix = pdf[page_no - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        return Response(pix.tobytes("png"), media_type="image/png")
+
+
+async def page_geometry(request: Request) -> JSONResponse:
+    job_id = request.path_params["job_id"]
+    doc_id = request.path_params["doc_id"]
+    page_no = int(request.path_params["page_no"])
+    document = next((d for d in core.load_job(job_id)["documents"] if d["doc_id"] == doc_id), None)
+    if not document:
+        raise ValueError("文档不存在")
+    path = core.job_dir(job_id) / "raw_pdf" / document["filename"]
+    if core.sha256_file(path) != document["sha256"]:
+        raise ValueError("原始 PDF 哈希不符")
+    with fitz.open(path) as pdf:
+        if not 1 <= page_no <= len(pdf):
+            raise ValueError("PDF 页码无效")
+        page = pdf[page_no - 1]
+        locations = []
+        for unit in core.evidence_for(job_id):
+            if unit["doc_id"] != doc_id:
+                continue
+            for loc in unit.get("source_locations", []):
+                if loc["pdf_page"] == page_no:
+                    rect = fitz.Rect(loc["bbox"]) * page.rotation_matrix
+                    locations.append({"evidence_unit_id": unit["evidence_unit_id"],
+                        "block_id": loc["block_id"], "precision": "block",
+                        "rect": [rect.x0 / page.rect.width, rect.y0 / page.rect.height,
+                                 rect.width / page.rect.width, rect.height / page.rect.height]})
+        return response({"rotation": page.rotation, "width": page.rect.width,
+                         "height": page.rect.height, "locations": locations})
 
 
 async def export_dataset(request: Request) -> JSONResponse:
@@ -291,6 +425,8 @@ async def download_export(request: Request) -> FileResponse:
     path = core.job_dir(job_id) / "exports" / f"aviation-sft-{kind}.zip"
     if not path.is_file():
         raise ValueError("数据包尚未生成")
+    if not core.export_is_current(job_id, path):
+        raise ValueError("导出包是历史快照；请重新生成当前版本")
     return FileResponse(path, media_type="application/zip", filename=path.name)
 
 async def semantic_txt(request: Request):
@@ -298,8 +434,8 @@ async def semantic_txt(request: Request):
     path = core.job_dir(job_id) / "parsed/semantic_corpus.txt"
     if request.method == "POST":
         return response(await run_in_threadpool(core.build_semantic_txt, job_id))
-    if not path.is_file():
-        raise ValueError("整体 TXT 尚未生成")
+    if not core.txt_is_current(job_id):
+        raise ValueError("整体 TXT 尚未生成或是历史版本；请重新生成")
     return FileResponse(
         path, media_type="text/plain; charset=utf-8",
         filename=f"{job_id}-semantic-corpus.txt",
@@ -332,6 +468,10 @@ async def value_error(_: Request, exc: ValueError) -> JSONResponse:
     return response({"error": str(exc)}, 400)
 
 
+async def revision_conflict(_: Request, exc: core.RevisionConflict) -> JSONResponse:
+    return response({"error": str(exc)}, 409)
+
+
 async def unexpected_error(_: Request, exc: Exception) -> JSONResponse:
     return response({"error": f"服务器操作失败：{exc}"}, 500)
 
@@ -352,10 +492,18 @@ routes = [
     Route("/api/jobs/{job_id}/evidence/item", add_evidence, methods=["POST"]),
     Route("/api/jobs/{job_id}/evidence/suggestions", evidence_suggestions, methods=["GET"]),
     Route("/api/jobs/{job_id}/evidence/batch", add_evidence_batch, methods=["POST"]),
+    Route("/api/jobs/{job_id}/evidence/cross-page-proposals", cross_page_proposals, methods=["GET"]),
+    Route("/api/jobs/{job_id}/evidence/cross-page-confirm", confirm_cross_page, methods=["POST"]),
     Route("/api/jobs/{job_id}/evidence/freeze", freeze_evidence, methods=["POST"]),
+    Route("/api/jobs/{job_id}/evidence/{evidence_unit_id}/verify", verify_evidence, methods=["POST"]),
+    Route("/api/jobs/{job_id}/quality-issues/{issue_id}", resolve_issue, methods=["POST"]),
     Route("/api/jobs/{job_id}/page", page_detail, methods=["GET"]),
     Route("/api/jobs/{job_id}/pdf/{doc_id}", source_pdf, methods=["GET"]),
     Route("/api/jobs/{job_id}/candidates", candidates, methods=["GET"]),
+    Route("/api/jobs/{job_id}/candidates/{sample_id}", candidate_detail, methods=["GET"]),
+    Route("/api/jobs/{job_id}/candidates/{sample_id}/review", review_one, methods=["POST"]),
+    Route("/api/jobs/{job_id}/page-image/{doc_id}/{page_no}", page_image, methods=["GET"]),
+    Route("/api/jobs/{job_id}/page-geometry/{doc_id}/{page_no}", page_geometry, methods=["GET"]),
     Route("/api/jobs/{job_id}/review-batch", review_batch, methods=["POST"]),
     Route("/api/jobs/{job_id}/export", export_dataset, methods=["POST"]),
     Route("/api/jobs/{job_id}/exports/{kind}", download_export, methods=["GET"]),
@@ -366,7 +514,8 @@ routes = [
 app = Starlette(
     debug=False,
     routes=routes,
-    exception_handlers={ValueError: value_error, Exception: unexpected_error},
+    exception_handlers={core.RevisionConflict: revision_conflict, ValueError: value_error,
+                        Exception: unexpected_error},
 )
 
 

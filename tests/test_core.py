@@ -35,6 +35,32 @@ def sample_job(tmp_path, monkeypatch):
     return job_id
 
 
+def verify_all_sources(job_id):
+    for issue in core.read_jsonl(core.job_dir(job_id) / "parsed/issues.jsonl"):
+        if issue["status"] == "待处理":
+            core.resolve_quality_issue(job_id, issue["issue_id"], "已核实", "test-reviewer", "对照构造 PDF 页面")
+    for unit in core.evidence_for(job_id):
+        core.verify_evidence_source(job_id, unit["evidence_unit_id"], "test-reviewer", "对照构造 PDF 页面文字")
+
+
+def add_v2_candidate(job_id, evidence_unit_id, question="What applies?"):
+    quote = "Civil aviation requirement"
+    answer = "Civil aviation requirement. [E1]"
+    return core.add_candidate(job_id, question, answer, [evidence_unit_id], "answerable",
+        claims=[{"claim_id": "C1", "text": quote, "answer_quote": quote,
+                 "evidence_ids": ["E1"],
+                 "supporting_quotes": [{"evidence_id": "E1", "quote": quote}]}],
+        schema_version="qa-v2")
+
+
+def approve_v2(job_id, record, reviewer="test-reviewer"):
+    return core.review_candidate(job_id, record["sample_id"], "approved", reviewer,
+        expected_revision=record["record_revision"],
+        claim_reviews=[{"claim_id": "C1", "verdict": "supported"}],
+        source_reviews=[{"evidence_unit_id": ref["evidence_unit_id"], "verified": True}
+                        for ref in record["evidence"]])
+
+
 def test_upload_parse_evidence_export_cleanup(sample_job):
     job_id = sample_job
     pages = core.pages_for(job_id)
@@ -44,11 +70,13 @@ def test_upload_parse_evidence_export_cleanup(sample_job):
     for n, split in enumerate(("train", "validation", "test")):
         e = core.add_evidence(job_id, pages[n]["blocks"][0]["block_id"], f"topic-{n}", f"group-{n}", split)
         ids.append(e["evidence_unit_id"])
+    verify_all_sources(job_id)
     frozen = core.freeze_splits(job_id)
     assert frozen["counts"] == {"test": 1, "train": 1, "validation": 1}
     r = core.add_candidate(job_id, "What is the first condition?", "The value is 10. [E1]", [ids[0]], "answerable", "The value is 10.")
     assert not core.validate_candidate(r, {e["evidence_unit_id"]: e for e in core.evidence_for(job_id)})
-    core.review_candidate(job_id, r["sample_id"], "approved", "R01")
+    with pytest.raises(ValueError, match="旧问答结构"):
+        core.review_candidate(job_id, r["sample_id"], "approved", "R01", expected_revision=r["record_revision"])
     report = core.quality_report(job_id)
     assert not report["final_ready"]
     assert report["evidence_target"] == 20
@@ -76,6 +104,7 @@ def test_split_leakage_and_exact_quote(sample_job):
     core.add_evidence(job_id, pages[0]["blocks"][0]["block_id"], "a", "same-group", "train")
     core.add_evidence(job_id, pages[1]["blocks"][0]["block_id"], "b", "same-group", "validation")
     core.add_evidence(job_id, pages[2]["blocks"][0]["block_id"], "c", "other-group", "test")
+    verify_all_sources(job_id)
     with pytest.raises(ValueError, match="跨 split"):
         core.freeze_splits(job_id)
 
@@ -139,9 +168,10 @@ def test_parse_scanned_pdf_keeps_native_text_and_ocr_bbox(tmp_path, monkeypatch)
     (tmp_path / "configs/settings.json").write_text(json.dumps(bad_config), encoding="utf-8")
     failing_job = core.create_job()
     core.upload_pdf(failing_job, "mixed.pdf", io.BytesIO(pdf_bytes))
-    with pytest.raises(ValueError, match="OCR 失败：mixed.pdf 第 2 页"):
-        core.parse_job(failing_job)
-    assert not (core.job_dir(failing_job) / "parsed/pages.jsonl").exists()
+    failed_report = core.parse_job(failing_job)
+    assert failed_report["failed_pages"] == 1
+    assert len(core.pages_for(failing_job)) == 2
+    assert any(i["code"] == "ocr_failed" for i in core.read_jsonl(core.job_dir(failing_job) / "parsed/issues.jsonl"))
 
 
 def test_batch_evidence_is_atomic_and_keeps_exact_sources(sample_job):
@@ -210,20 +240,23 @@ def test_batch_review_prevalidates_all_candidates(sample_job):
     pages = core.pages_for(job_id)
     units = [core.add_evidence(job_id, page["blocks"][0]["block_id"], f"topic-{n}", f"group-{n}", split)
              for n, (page, split) in enumerate(zip(pages, ("train", "validation", "test")))]
+    verify_all_sources(job_id)
     core.freeze_splits(job_id)
-    a = core.add_candidate(job_id, "Question A?", "Value 10. [E1]", [units[0]["evidence_unit_id"]], "answerable", "Value 10.")
-    b = core.add_candidate(job_id, "Question B?", "Value 10. [E1]", [units[0]["evidence_unit_id"]], "answerable", "Value 10.")
+    a = add_v2_candidate(job_id, units[0]["evidence_unit_id"], "Question A?")
+    b = add_v2_candidate(job_id, units[0]["evidence_unit_id"], "Question B?")
+    reviews = {r["sample_id"]: [{"claim_id": "C1", "verdict": "supported"}] for r in (a, b)}
+    sources = {r["sample_id"]: [{"evidence_unit_id": units[0]["evidence_unit_id"], "verified": True}] for r in (a, b)}
     records_path = core.job_dir(job_id) / "candidates/records.jsonl"
     records = core.candidates_for(job_id)
     records[1]["evidence"][0]["quote"] = "invented quote"
     core.write_jsonl(records_path, records)
     with pytest.raises(ValueError, match="引用范围"):
-        core.review_candidates_batch(job_id, [a["sample_id"], b["sample_id"]], "reviewer-1")
+        core.review_candidates_batch(job_id, [a["sample_id"], b["sample_id"]], "reviewer-1", expected_revisions={a["sample_id"]: 1, b["sample_id"]: 1}, claim_reviews=reviews, source_reviews=sources)
     assert all(r["review"]["status"] == "pending" for r in core.candidates_for(job_id))
     assert core.read_jsonl(core.job_dir(job_id) / "reviewed/events.jsonl") == []
     records[1]["evidence"][0]["quote"] = units[0]["quote"]
     core.write_jsonl(records_path, records)
-    result = core.review_candidates_batch(job_id, [a["sample_id"], b["sample_id"]], "reviewer-1")
+    result = core.review_candidates_batch(job_id, [a["sample_id"], b["sample_id"]], "reviewer-1", expected_revisions={a["sample_id"]: 1, b["sample_id"]: 1}, claim_reviews=reviews, source_reviews=sources)
     assert result["updated"] == 2
     reviewed = core.candidates_for(job_id)
     assert all(r["review"]["status"] == "approved" for r in reviewed)
@@ -290,17 +323,15 @@ def test_quality_report_flags_cross_split_leakage_and_document_coverage(sample_j
             job_id, pages[n]["blocks"][0]["block_id"], f"topic-{n}", f"group-{n}",
             split, "Civil aviation requirement",
         ))
+    verify_all_sources(job_id)
     core.freeze_splits(job_id)
     for unit in units:
-        candidate = core.add_candidate(
-            job_id, "What is the aviation requirement?", "The evidence mentions an aviation requirement. [E1]",
-            [unit["evidence_unit_id"]], "answerable", "The evidence mentions an aviation requirement.",
-        )
-        core.review_candidate(job_id, candidate["sample_id"], "approved", "reviewer-1")
+        candidate = add_v2_candidate(job_id, unit["evidence_unit_id"], "What is the aviation requirement?")
+        approve_v2(job_id, candidate, "reviewer-1")
     report = core.quality_report(job_id)
     assert report["approved_by_document"] == {"test.pdf": 3}
     assert report["approved_evidence_units_by_document"] == {"test.pdf": 3}
-    assert report["semantic_validation"] == "not_independently_validated"
+    assert report["semantic_validation"] == "policy_reviewed"
     assert any("跨分区重复原文证据" in issue for issue in report["issues"])
     assert any("跨分区重复获批问题" in issue for issue in report["issues"])
     assert any("获批问答不足 30 条" in issue for issue in report["issues"])
@@ -308,7 +339,7 @@ def test_quality_report_flags_cross_split_leakage_and_document_coverage(sample_j
     path, _, _ = core.export_job(job_id, include_audit=True)
     with zipfile.ZipFile(path) as archive:
         card = json.loads(archive.read("dataset_card.json"))
-    assert card["semantic_validation"] == "not_independently_validated"
+    assert card["semantic_validation"] == "policy_reviewed"
 
 
 def test_remove_mistaken_pdf_only_before_parsing(sample_job):
@@ -618,10 +649,10 @@ def test_training_and_trace_exports_preserve_identical_samples(sample_job):
     unit = core.add_evidence(job, block["block_id"], "topic", "group", "train")
     for page, split in zip(core.pages_for(job)[1:], ("validation", "test")):
         core.add_evidence(job, page["blocks"][0]["block_id"], "topic", split, split)
+    verify_all_sources(job)
     core.freeze_splits(job)
-    candidate = core.add_candidate(job, "What applies?", "Value 10 applies. [E1]",
-                                   [unit["evidence_unit_id"]], "answerable", "Value 10 applies.")
-    core.review_candidate(job, candidate["sample_id"], "approved", "reviewer")
+    candidate = add_v2_candidate(job, unit["evidence_unit_id"])
+    approve_v2(job, candidate, "reviewer")
     evidence_before = (core.job_dir(job) / "evidence/units.jsonl").read_bytes()
     candidates_before = (core.job_dir(job) / "candidates/records.jsonl").read_bytes()
     path, digest, _ = core.export_job(job)

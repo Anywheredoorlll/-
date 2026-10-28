@@ -5,13 +5,21 @@ from urllib.parse import urlparse
 
 from aviation_ft import core
 
+ROLES = {"generator", "judge_primary", "judge_countercheck"}
+
+
+def _role(role: str) -> str:
+    if role not in ROLES:
+        raise ValueError("无效模型角色")
+    return role
+
 def provider_dir() -> Path:
     return core.ROOT / "runtime/provider_secrets"
 
 
-def _path(job_id: str) -> Path:
+def _path(job_id: str, role: str = "generator") -> Path:
     core.job_dir(job_id)
-    return provider_dir() / f"{job_id}.json"
+    return provider_dir() / (f"{job_id}.json" if _role(role) == "generator" else f"{job_id}.{role}.json")
 
 
 def _validate_url(base_url: str) -> str:
@@ -26,11 +34,12 @@ def _validate_url(base_url: str) -> str:
     raise ValueError("外部 API 必须使用 HTTPS；本机接口可使用带端口的 HTTP")
 
 
-def public_config(job_id: str) -> dict:
-    stored = core.read_json(_path(job_id), {})
+def public_config(job_id: str, role: str = "generator") -> dict:
+    stored = core.read_json(_path(job_id, role), {})
     key = stored.get("api_key", "")
     preset = _preset(stored.get("preset_id", ""))
     return {
+        "role": role,
         "mode": "external" if stored.get("enabled") else "local",
         "configured": bool(stored.get("enabled") and key),
         "base_url": stored.get("base_url", ""),
@@ -50,8 +59,9 @@ def save_external(
     api_key: str,
     privacy_acknowledged: bool,
     preset_id: str = "",
+    role: str = "generator",
 ) -> dict:
-    path = _path(job_id)
+    path = _path(job_id, role)
     previous = core.read_json(path, {})
     secret = api_key.strip() or previous.get("api_key", "")
     if not privacy_acknowledged:
@@ -84,30 +94,36 @@ def save_external(
         "updated_at": core.now(),
     })
     path.chmod(0o600)
-    return public_config(job_id)
+    return public_config(job_id, role)
 
 
-def use_local(job_id: str) -> dict:
-    path = _path(job_id)
+def use_local(job_id: str, role: str = "generator") -> dict:
+    path = _path(job_id, role)
     if path.exists():
         stored = core.read_json(path, {})
         stored["enabled"] = False
         stored["updated_at"] = core.now()
         core.write_json(path, stored)
         path.chmod(0o600)
-    return public_config(job_id)
+    return public_config(job_id, role)
 
 
-def effective_config(job_id: str | None, local: dict) -> dict:
+def effective_config(job_id: str | None, local: dict, role: str = "generator") -> dict:
+    _role(role)
     if not job_id:
+        if role != "generator" and not local.get("role_configured"):
+            raise ValueError(f"{role} 尚未配置独立模型")
         return local
-    stored = core.read_json(_path(job_id), {})
+    stored = core.read_json(_path(job_id, role), {})
     if not stored.get("enabled"):
+        if role != "generator" and not local.get("role_configured"):
+            raise ValueError(f"{role} 尚未配置独立模型")
         return local
     if not stored.get("privacy_acknowledged") or not stored.get("api_key"):
         raise ValueError("外部 API 配置不完整")
     result = dict(local)
     result.update({
+        "role": role,
         "provider_mode": "external",
         "base_url": _validate_url(stored.get("base_url", "")),
         "served_model_name": stored.get("model", ""),

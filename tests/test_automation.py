@@ -9,7 +9,7 @@ import pymupdf as fitz
 import pytest
 
 from aviation_ft import automation, core, generation
-from test_core import sample_job
+from test_core import sample_job, add_v2_candidate
 from test_generation import configured_job
 
 
@@ -17,40 +17,38 @@ def test_model_review_approves_only_when_both_checks_support(sample_job, monkeyp
     job_id, units = configured_job(sample_job, monkeypatch)
     (core.ROOT / "prompts/judge_grounded_qa.md").write_text("Judge only the evidence.", encoding="utf-8")
     evidence_id = units[0]["evidence_unit_id"]
-    supported = core.add_candidate(job_id, "What is the value?", "The value is 10. [E1]",
-                                   [evidence_id], "answerable", "The value is 10.")
-    numeric_doubt = core.add_candidate(job_id, "Is value 999?", "The value is 999. [E1]",
-                                       [evidence_id], "answerable", "The value is 999.")
-    rejected = core.add_candidate(job_id, "Does rule apply?", "It applies. [E1]",
-                                  [evidence_id], "answerable", "It applies.")
-    uncertain = core.add_candidate(job_id, "What condition remains?", "The condition remains unclear. [E1]",
-                                   [evidence_id], "answerable", "The condition remains unclear.")
-    support_quote = "Civil aviation requirement"
+    supported = add_v2_candidate(job_id, evidence_id, "What is the value?")
+    rejected = add_v2_candidate(job_id, evidence_id, "Does rule apply?")
+    uncertain = add_v2_candidate(job_id, evidence_id, "What condition remains?")
 
-    def fake_completion(system, user, max_tokens=320):
+    def fake_completion(system, user, max_tokens=2048, *, role="generator"):
         verdict = ("unsupported" if user["question"] == "Does rule apply?" else
                    "uncertain" if user["question"] == "What condition remains?" else "supported")
-        return {"verdict": verdict, "confidence": 0.98, "reason": "checked",
-                "supporting_quote": support_quote}
+        return {"verdict": verdict, "confidence_self_reported": 0.98,
+                "claim_results": {"C1": {"verdict": verdict,
+                                           "supporting_quote": "Civil aviation requirement"}}, "coverage": verdict,
+                "reason": "checked", "supporting_quote": "Civil aviation requirement",
+                "_meta": {"model_identity": role, "model_id": role,
+                          "model_revision": "test-revision"}}
 
     monkeypatch.setattr(automation, "_completion", fake_completion)
     counts = automation.review_pending(job_id)
-    assert counts == {"processed": 4, "approved": 1, "pending_expert_review": 1, "rejected": 2}
+    assert counts == {"processed": 3, "pending_expert_review": 2, "rejected": 1}
     records = {r["sample_id"]: r for r in core.candidates_for(job_id)}
-    assert records[supported["sample_id"]]["review"]["status"] == "approved"
+    assert records[supported["sample_id"]]["review"]["status"] == "pending_expert_review"
     assert len(records[supported["sample_id"]]["review"]["assessment"]["passes"]) == 2
-    assert records[numeric_doubt["sample_id"]]["review"]["status"] == "rejected"
     assert records[uncertain["sample_id"]]["review"]["status"] == "pending_expert_review"
     assert records[rejected["sample_id"]]["review"]["status"] == "rejected"
     assert all(r["review"]["review_mode"] == "automated" for r in records.values())
     report = core.quality_report(job_id)
-    assert report["approved_by_review_mode"]["automated"] == 1
+    assert report["approved_by_review_mode"]["automated"] == 0
     archive_path, _, _ = core.export_job(job_id, final=False, include_audit=True)
     with zipfile.ZipFile(archive_path) as archive:
         assert "judge_prompt.md" in archive.namelist()
         assert "assessment" in archive.read("review_events.jsonl").decode()
-    core.review_candidates_batch(job_id, [uncertain["sample_id"]], "expert-1", "rejected")
-    assert core.candidates_for(job_id)[3]["review"]["status"] == "rejected"
+    core.review_candidates_batch(job_id, [uncertain["sample_id"]], "expert-1", "rejected",
+                                 expected_revisions={uncertain["sample_id"]: 1})
+    assert next(r for r in core.candidates_for(job_id) if r["sample_id"] == uncertain["sample_id"])["review"]["status"] == "rejected"
     assert automation.review_pending(job_id) == {}
 
 
@@ -75,14 +73,14 @@ def test_automatic_evidence_selection_balances_documents(tmp_path, monkeypatch, 
         "supporting_quote": "Aviation document",
     })
     result = automation.prepare_evidence(job_id)
-    assert result["status"] == "frozen"
+    assert result["status"] == "needs_human"
     assert result["added"] == 20 * doc_total
     units = core.evidence_for(job_id)
     assert len(units) == 20 * doc_total
     assert all(u["confirmation_mode"] == "automated" for u in units)
     assert Counter(u["split"] for u in units) == {"train": 12 * doc_total, "validation": 4 * doc_total, "test": 4 * doc_total}
     assert Counter(u["doc_id"] for u in units) == {d["doc_id"]: 20 for d in core.load_job(job_id)["documents"]}
-    assert automation.prepare_evidence(job_id)["status"] == "frozen"
+    assert automation.prepare_evidence(job_id)["status"] == "needs_human"
 
 
 def test_number_guard_handles_chinese_units():

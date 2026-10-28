@@ -1,0 +1,17 @@
+{
+  "min_nonspace_chars": 30,
+  "replacement_char_ratio_trigger": 0.005,
+  "private_use_char_ratio_trigger": 0.01,
+  "image_area_ratio_trigger": 0.60,
+  "text_area_ratio_low": 0.01,
+  "native_ocr_disagreement_trigger": 0.05,
+  "ocr_retry_dpi": 400,
+  "ocr_max_attempts": 2,
+  "cross_page_merge_mode": "propose_only",
+  "max_cross_page_span": 2,
+  "max_semantic_chars": 12000,
+  "same_column_required": true,
+  "section_consistency_required": true,
+  "block_on_order_ambiguity": true,
+  "table_continuation_requires_schema_match": true
+}

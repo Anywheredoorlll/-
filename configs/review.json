@@ -1,0 +1,22 @@
+{
+  "review_policy_version": "review-v2",
+  "auto_approve_enabled": false,
+  "require_distinct_model_identity": true,
+  "temperature": 0,
+  "max_tokens": 2048,
+  "timeout_seconds": 180,
+  "calibration_id": null,
+  "max_claims_per_answer": 8,
+  "require_exact_answer_span": true,
+  "require_exact_supporting_quote": true,
+  "require_all_factual_claims_supported": true,
+  "allow_uncovered_factual_spans": false,
+  "require_subject_alignment": true,
+  "require_property_alignment": true,
+  "require_unit_alignment": true,
+  "require_condition_alignment": true,
+  "require_operator_alignment": true,
+  "allow_derived_calculation": false,
+  "allow_unit_conversion": false,
+  "on_unparsed_numeric_fact": "needs_human"
+}

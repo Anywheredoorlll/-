@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from aviation_ft import automation, core, generation, workflow
+from aviation_ft import automation, core, generation, migration, workflow
 
 
 def main() -> None:
@@ -32,6 +32,9 @@ def main() -> None:
     quality.add_argument("job_id")
     cleanup = commands.add_parser("cleanup", help="列出到期的正式导出任务；默认只预览")
     cleanup.add_argument("--execute", action="store_true", help="真正清理到期任务")
+    migrate = commands.add_parser("migrate", help="显式复制旧任务并重解析；默认 dry-run")
+    migrate.add_argument("job_id")
+    migrate.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     if args.command == "list":
         print(json.dumps(core.list_jobs(), ensure_ascii=False, indent=2))
@@ -76,6 +79,9 @@ def main() -> None:
                 if info:
                     core.cleanup_job(job_id, job_id, info["sha256"], reason="retention_expired")
                     print(f"cleaned {job_id}")
+    elif args.command == "migrate":
+        print(json.dumps(migration.migrate_job(args.job_id, dry_run=not args.execute),
+                         ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

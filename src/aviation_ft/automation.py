@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 
-from aviation_ft import core, generation
+from aviation_ft import core, generation, review_policy
 
 EVIDENCE_TARGETS = {"train": 12, "validation": 4, "test": 4}
 CONFIDENCE = 0.90
@@ -19,8 +19,10 @@ EVIDENCE_CONFIDENCE = 0.95
 _PROVIDER_JOB_ID: ContextVar[str | None] = ContextVar("provider_job_id", default=None)
 
 
-def _provider_config() -> dict:
+def _provider_config(role: str = "generator") -> dict:
     parameters = inspect.signature(generation.config).parameters
+    if "role" in parameters:
+        return generation.config(_PROVIDER_JOB_ID.get(), role=role)
     return generation.config(_PROVIDER_JOB_ID.get()) if "job_id" in parameters else generation.config()
 
 
@@ -35,8 +37,11 @@ def _with_provider_context(fn):
     return wrapped
 
 
-def _completion(system: str, user: dict, max_tokens: int = 320) -> dict:
-    cfg = _provider_config()
+def _completion(system: str, user: dict, max_tokens: int = 2048,
+                *, role: str = "generator") -> dict:
+    cfg = _provider_config(role)
+    if role != "generator":
+        max_tokens = int(cfg.get("max_tokens", max_tokens))
     response = generation._configured_request(
         cfg,
         "/chat/completions",
@@ -47,18 +52,44 @@ def _completion(system: str, user: dict, max_tokens: int = 320) -> dict:
          "chat_template_kwargs": {"enable_thinking": False}},
         timeout=int(cfg["timeout_seconds"]),
     )
-    return generation._parse_json(response["choices"][0]["message"]["content"])
+    choice = response["choices"][0]
+    if choice.get("finish_reason") in {"length", "content_filter"}:
+        raise ValueError("评审模型响应被截断或过滤")
+    raw = choice["message"]["content"]
+    data = generation._parse_json(raw)
+    if "_meta" in data:
+        raise ValueError("评审模型返回保留元数据字段")
+    data["_meta"] = {"provider": cfg.get("provider_mode", "local"),
+        "model_id": cfg["model_id"], "model_revision": cfg.get("model_revision") or "unknown",
+        "model_identity": f"{cfg['model_id']}@{cfg.get('model_revision') or 'unknown'}",
+        "prompt_sha256": hashlib.sha256(("/no_think\n" + system).encode()).hexdigest(),
+        "request_settings": {"temperature": 0, "max_tokens": max_tokens,
+                             "timeout_seconds": int(cfg["timeout_seconds"])},
+        "response_sha256": hashlib.sha256(raw.encode()).hexdigest()}
+    return data
 
 
 def _assessment(data: dict, valid_verdicts: set[str]) -> dict:
-    if set(data) != {"verdict", "confidence", "reason", "supporting_quote"}:
+    metadata = data.pop("_meta", {})
+    judge = "supported" in valid_verdicts
+    expected = ({"verdict", "claim_results", "coverage", "confidence_self_reported", "reason", "supporting_quote"}
+                if judge else {"verdict", "confidence", "reason", "supporting_quote"})
+    if set(data) != expected:
         raise ValueError("核验模型未返回规定字段")
-    if data["verdict"] not in valid_verdicts or not isinstance(data["reason"], str) or not isinstance(data["supporting_quote"], str):
+    if data["verdict"] not in valid_verdicts or not isinstance(data["reason"], str) or not data["reason"].strip() or not isinstance(data["supporting_quote"], str):
         raise ValueError("核验模型返回的结论无效")
-    score = data["confidence"]
+    score = data["confidence_self_reported"] if judge else data["confidence"]
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
         raise ValueError("核验模型返回的置信度无效")
-    return data
+    if judge:
+        if not isinstance(data["claim_results"], dict) or data["coverage"] not in {"supported", "unsupported", "uncertain"}:
+            raise ValueError("评审断言或覆盖格式无效")
+        if any(not isinstance(v, dict) or set(v) != {"verdict", "supporting_quote"}
+               or v["verdict"] not in {"supported", "unsupported", "uncertain"}
+               or not isinstance(v["supporting_quote"], str)
+               for v in data["claim_results"].values()):
+            raise ValueError("评审断言结论无效")
+    return {**data, **metadata, "confidence": score}
 
 
 def _evidence_suitability(item: dict) -> dict:
@@ -87,6 +118,7 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
     if not (p / "parsed/report.json").exists():
         core.parse_job(job_id)
     if (p / "evidence/splits.json").exists():
+        core.freeze_splits(job_id)
         return {"status": "frozen", "added": 0, "assessed": 0, "issues": []}
     cfg = _provider_config()
     pages = {(page["doc_id"], page["pdf_page"]): page for page in core.pages_for(job_id)}
@@ -125,7 +157,10 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
                     continue
                 previous = cached.get(item["block_id"])
                 quote_sha = hashlib.sha256(item["quote"].encode()).hexdigest()
-                if previous and previous["quote_sha256"] == quote_sha:
+                if (previous and previous["quote_sha256"] == quote_sha
+                        and previous.get("model_id") == cfg.get("model_id")
+                        and previous.get("model_revision") == cfg.get("model_revision")
+                        and previous.get("assessment_version") == "evidence-suitability-v2"):
                     verdict = previous["verdict"]
                     score = previous["confidence"]
                     supporting = previous["supporting_quote"]
@@ -141,7 +176,9 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
                     assessed += 1
                     log = {"at": core.now(), "block_id": item["block_id"], "quote_sha256": quote_sha,
                            "verdict": verdict, "confidence": score, "supporting_quote": supporting,
-                           "reason": reason, "model_id": cfg["model_id"]}
+                           "reason": reason, "model_id": cfg["model_id"],
+                           "model_revision": cfg.get("model_revision"),
+                           "assessment_version": "evidence-suitability-v2"}
                     core.append_jsonl(assessments_path, log)
                     cached[item["block_id"]] = log
                 if verdict == "suitable" and score >= EVIDENCE_CONFIDENCE and supporting and supporting in item["quote"]:
@@ -167,6 +204,10 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
             by_split["test"] < 4 * document_count):
         return {"status": "needs_human", "added": added, "assessed": assessed,
                 "issues": issues + [{"reason": "总证据或验证/测试证据不足"}]}
+    pending = [unit for unit in all_units if not review_policy.source_verified(unit)]
+    if pending:
+        return {"status": "needs_human", "added": added, "assessed": assessed,
+                "issues": issues + [{"reason": f"{len(pending)} 条证据需要对照 PDF 核实后冻结"}]}
     core.freeze_splits(job_id)
     return {"status": "frozen", "added": added, "assessed": assessed, "issues": issues}
 
@@ -208,7 +249,20 @@ def _judge_candidate(record: dict) -> dict:
     user = {"question": record["question"], "answer": record["answer"],
             "answerability": record["answerability"], "claims": record["claims"],
             "evidence": evidence_text}
-    first = _assessment(_completion(prompt, user), {"supported", "unsupported", "uncertain"})
+    first = _assessment(_completion(prompt, user, role="judge_primary"), {"supported", "unsupported", "uncertain"})
+    first["judged_record_sha256"] = core.candidate_content_sha256(record)
+    claim_ids = {c["claim_id"] for c in record["claims"]}
+    if set(first["claim_results"]) != claim_ids:
+        raise ValueError("主评审返回未知或缺失的 claim ID")
+    def validate_supports(pass_result: dict) -> None:
+        refs = {ref["evidence_id"]: ref["quote"] for ref in record["evidence"]}
+        for claim in record["claims"]:
+            item = pass_result["claim_results"][claim["claim_id"]]
+            quote = item["supporting_quote"]
+            if (item["verdict"] == "supported" and not quote) or (
+                    quote and not any(quote in refs.get(eid, "") for eid in claim["evidence_ids"])):
+                raise ValueError("评审断言的支持片段无法精确定位到对应证据")
+    validate_supports(first)
     if first["verdict"] != "supported" or first["confidence"] < CONFIDENCE:
         verdict = first["verdict"] if first["confidence"] >= CONFIDENCE else "uncertain"
         return {
@@ -221,9 +275,13 @@ def _judge_candidate(record: dict) -> dict:
         else "请从反例角度再次核查，尤其寻找答案中任何原文没有的数字、条件或断言；有疑点选择 uncertain。"
     )
     second = _assessment(
-        _completion(prompt + "\n" + countercheck, user),
+        _completion(prompt + "\n" + countercheck, user, role="judge_countercheck"),
         {"supported", "unsupported", "uncertain"},
     )
+    second["judged_record_sha256"] = core.candidate_content_sha256(record)
+    if set(second["claim_results"]) != claim_ids:
+        raise ValueError("反例评审返回未知或缺失的 claim ID")
+    validate_supports(second)
     verdict = "supported" if second["verdict"] == "supported" and second["confidence"] >= CONFIDENCE else "uncertain"
     return {
         "passes": [first, second], "verdict": verdict,
@@ -242,7 +300,7 @@ def review_pending(
     if not 1 <= limit <= 500:
         raise ValueError("自动审核数量必须在 1 到 500 之间")
     cfg = _provider_config()
-    units = {unit["evidence_unit_id"]: unit for unit in core.evidence_for(job_id)}
+    units = {unit["evidence_unit_id"]: unit for unit in core.current_evidence_units(job_id)}
     summary = Counter()
     eligible = {"pending", "pending_expert_review"} if include_expert_review else {"pending"}
     for record in core.candidates_for(job_id):
@@ -254,14 +312,19 @@ def review_pending(
         if errors:
             verdict = "rejected"
             assessment = {"verdict": verdict, "reason": "；".join(errors), "check": "deterministic"}
-        elif any(units[ref["evidence_unit_id"]].get("ocr_used") for ref in record["evidence"]):
+        elif any(not review_policy.source_verified(units[ref["evidence_unit_id"]]) for ref in record["evidence"]):
             verdict = "pending_expert_review"
-            assessment = {"verdict": "uncertain", "reason": "OCR 原文需人工核对", "check": "deterministic"}
-        elif (record["answerability"] == "answerable" and
-              not _number_tokens(record["answer"] + " " + " ".join(c["text"] for c in record["claims"])).issubset(
-                  _number_tokens(" ".join(ref["quote"] for ref in record["evidence"])))):
-            verdict = "rejected"
-            assessment = {"verdict": "unsupported", "reason": "答案数字未能在证据中直接找到，不符合直接引用要求", "check": "deterministic"}
+            assessment = {"verdict": "uncertain", "reason": "来源尚未对照 PDF 核实", "check": "source"}
+        elif record.get("coverage_check", {}).get("status") != "structure_checked":
+            verdict = "pending_expert_review"
+            assessment = {"verdict": "uncertain", "reason": "答案事实覆盖待核对", "check": "coverage"}
+        elif (_number_tokens(record.get("answer", ""))
+              - _number_tokens("\n".join(ref["quote"] for ref in record["evidence"]))):
+            verdict = "pending_expert_review"
+            assessment = {"verdict": "uncertain", "reason": "答案存在证据中没有的数字；集合检查仅作预警", "check": "number_set_warning"}
+        elif record.get("numeric_checks", {}).get("status") not in {"structure_checked", "not_applicable"}:
+            verdict = "pending_expert_review"
+            assessment = {"verdict": "uncertain", "reason": "数值主体、关系或单位待核对", "check": "numeric"}
         else:
             try:
                 assessment = _judge_candidate(record)
@@ -273,20 +336,29 @@ def review_pending(
                             for item in assessment["passes"]
                         ]
                         assessment["supporting_quote_match"] = modes
-                        if "none" in modes:
+                        if any(mode != "exact" for mode in modes):
                             assessment["verdict"] = "uncertain"
-                            assessment["reason"] = "模型支持片段规范化后仍无法定位原文"
+                            assessment["reason"] = "模型支持片段无法精确定位原文"
                 verdict = {"supported": "approved", "unsupported": "rejected",
                            "uncertain": "pending_expert_review"}[assessment["verdict"]]
+                if verdict == "approved":
+                    gate = review_policy.evaluate_approval(record, units, assessment,
+                        review_policy.config(core.ROOT, job_id), automated=True)
+                    assessment["approval_gate"] = gate
+                    if not gate["approved"]:
+                        verdict = "pending_expert_review"
             except Exception as exc:
                 verdict = "pending_expert_review"
                 assessment = {"verdict": "uncertain", "reason": str(exc), "check": "model_error"}
         assessment["model_id"] = cfg["model_id"]
         assessment["model_revision"] = cfg.get("model_revision")
-        judge_path = core.ROOT / "prompts/judge_grounded_qa.md"
+        judge_path = core.ROOT / "prompts" / (
+            "judge_unanswerable_qa.md" if record["answerability"] == "unanswerable"
+            else "judge_grounded_qa.md")
         assessment["judge_prompt_sha256"] = core.sha256_file(judge_path) if judge_path.is_file() else None
         core.review_candidate(job_id, record["sample_id"], verdict,
-                              f"model:{cfg['served_model_name']}", assessment.get("reason", ""), assessment)
+                              f"model:{cfg['served_model_name']}", assessment.get("reason", ""), assessment,
+                              expected_revision=record.get("record_revision", 1))
         summary["processed"] += 1
         summary[verdict] += 1
     return dict(summary)
@@ -303,6 +375,7 @@ def advance(job_id: str, max_new: int = 200, max_review: int = 300) -> dict:
         if evidence["status"] != "frozen":
             return {"status": evidence["status"], "evidence": evidence}
     else:
+        core.freeze_splits(job_id)
         evidence = {"status": "frozen", "added": 0}
     levels = [8, 12, 18, 24, 30]
     level_path = p / "automation/generation_level.json"

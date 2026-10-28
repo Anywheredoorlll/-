@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+import os
 import zipfile
 
 import pytest
@@ -27,6 +28,7 @@ def test_external_provider_is_job_scoped_masked_and_not_exported(sample_job, mon
         job_id, "https://api.example.com/v1/", "remote-model", "secret-key-1234", True,
     )
     assert public == {
+        "role": "generator",
         "mode": "external",
         "configured": True,
         "base_url": "https://api.example.com/v1",
@@ -39,7 +41,10 @@ def test_external_provider_is_job_scoped_masked_and_not_exported(sample_job, mon
     }
     assert "secret-key-1234" not in str(public)
     secret_path = providers.provider_dir() / f"{job_id}.json"
-    assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
+    else:
+        assert secret_path.parent == providers.provider_dir()
 
     cfg = generation.config(job_id)
     assert cfg["provider_mode"] == "external"

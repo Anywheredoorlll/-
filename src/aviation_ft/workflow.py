@@ -59,17 +59,24 @@ def task_progress(job_id: str) -> dict:
     }
 
 
-def review_queue(records: list[dict], units: list[dict]) -> list[dict]:
+def review_queue(records: list[dict], units: list[dict], include_all: bool = False) -> list[dict]:
     """Surface OCR and invalid references first; never approve on a heuristic alone."""
     unit_map = {item["evidence_unit_id"]: item for item in units}
     pending = []
     for record in records:
-        if record["review"]["status"] not in {"pending", "pending_expert_review"}:
+        if not include_all and record["review"]["status"] not in {"pending", "pending_expert_review"}:
             continue
         errors = core.validate_candidate(record, unit_map)
         flags = []
         if errors:
             flags.append("结构异常")
+        if any(not core.review_policy.source_verified(unit_map.get(ref.get("evidence_unit_id"), {}))
+               for ref in record["evidence"]):
+            flags.append("来源未核实")
+        if record.get("coverage_check", {}).get("status") != "structure_checked":
+            flags.append("事实覆盖待核对")
+        if record.get("numeric_checks", {}).get("status") not in {"structure_checked", "not_applicable"}:
+            flags.append("数值待核对")
         if any(unit_map.get(ref.get("evidence_unit_id"), {}).get("ocr_used") for ref in record["evidence"]):
             flags.append("OCR 原文")
         if record["answerability"] == "unanswerable":

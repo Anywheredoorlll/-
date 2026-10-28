@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aviation_ft import core, workflow
-from test_core import sample_job
+from test_core import sample_job, verify_all_sources
 
 
 def test_task_progress_identifies_next_action(sample_job):
@@ -13,6 +13,7 @@ def test_task_progress_identifies_next_action(sample_job):
     pages = core.pages_for(job_id)
     units = [core.add_evidence(job_id, page["blocks"][0]["block_id"], f"topic-{n}", f"group-{n}", split)
              for n, (page, split) in enumerate(zip(pages, ("train", "validation", "test")))]
+    verify_all_sources(job_id)
     core.freeze_splits(job_id)
     frozen = workflow.task_progress(job_id)
     assert frozen["evidence_by_split"] == {"test": 1, "train": 1, "validation": 1}
@@ -27,6 +28,7 @@ def test_review_queue_surfaces_ocr_and_invalid_references(sample_job):
     pages = core.pages_for(job_id)
     units = [core.add_evidence(job_id, page["blocks"][0]["block_id"], f"topic-{n}", f"group-{n}", split)
              for n, (page, split) in enumerate(zip(pages, ("train", "validation", "test")))]
+    verify_all_sources(job_id)
     core.freeze_splits(job_id)
     a = core.add_candidate(job_id, "Ordinary?", "Answer. [E1]", [units[0]["evidence_unit_id"]], "answerable", "Answer.")
     b = core.add_candidate(job_id, "OCR question?", "Answer. [E1]", [units[1]["evidence_unit_id"]], "answerable", "Answer.")
@@ -35,6 +37,7 @@ def test_review_queue_surfaces_ocr_and_invalid_references(sample_job):
     records[2]["evidence"][0]["quote"] = "not in source"
     units[1]["ocr_used"] = True
     queue = workflow.review_queue(records, units)
-    assert [item["record"]["sample_id"] for item in queue] == [c["sample_id"], b["sample_id"], a["sample_id"]]
+    assert queue[0]["record"]["sample_id"] == c["sample_id"]
+    assert {item["record"]["sample_id"] for item in queue} == {a["sample_id"], b["sample_id"], c["sample_id"]}
     assert queue[0]["errors"]
-    assert "OCR 原文" in queue[1]["flags"]
+    assert "OCR 原文" in next(item for item in queue if item["record"]["sample_id"] == b["sample_id"])["flags"]

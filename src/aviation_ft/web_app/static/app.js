@@ -188,7 +188,7 @@ async function useLocalProvider(){try{await api(`/api/jobs/${state.jobId}/provid
 
 async function switchView(view){state.view=view;state.evidence=null;state.candidates=null;$$(".nav-item").forEach(x=>x.classList.toggle("active",x.dataset.view===view));$("#content").innerHTML=loading();try{await render()}catch(e){toast(e.message,true);$("#content").innerHTML=`<div class="empty"><div><strong>页面加载失败</strong>${esc(e.message)}</div></div>`}}
 $("#main-nav").addEventListener("click",e=>{const b=e.target.closest("[data-view]");if(b)switchView(b.dataset.view)});
-$("#job-select").addEventListener("change",async e=>{state.jobId=e.target.value;state.evidence=null;state.candidates=null;await loadDashboard()});
+$("#job-select").addEventListener("change",async e=>{await changeJob(e.target.value)});
 $("#new-job-button").onclick=()=>$("#job-dialog").showModal();
 $("#create-job").addEventListener("click",async e=>{e.preventDefault();const label=$("#job-label").value.trim();if(!label)return;try{const x=await api("/api/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label})});$("#job-dialog").close();$("#job-label").value="";toast("任务已创建");await loadJobs(x.job_id)}catch(err){toast(err.message,true)}});
 $("#delete-job-button").onclick=()=>{
@@ -212,6 +212,6 @@ $("#confirm-delete-job").onclick=async()=>{
  finally{button.disabled=false}
 };
 $("#refresh-button").onclick=async()=>{state.evidence=null;state.candidates=null;await loadDashboard();toast("数据已刷新")};
-$("#global-search").addEventListener("keydown",e=>{if(e.key==="Enter"){const q=e.target.value.toLowerCase();const match=state.jobs.find(j=>(j.label||"").toLowerCase().includes(q)||j.job_id.includes(q));if(match){state.jobId=match.job_id;$("#job-select").value=match.job_id;loadDashboard()}else toast("没有匹配的任务",true)}});
+$("#global-search").addEventListener("keydown",e=>{if(e.key==="Enter"){const q=e.target.value.toLowerCase();const match=state.jobs.find(j=>(j.label||"").toLowerCase().includes(q)||j.job_id.includes(q));if(match)changeJob(match.job_id);else toast("没有匹配的任务",true)}});
 document.addEventListener("keydown",e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="k"){e.preventDefault();$("#global-search").focus()}});
 loadJobs().catch(e=>toast(e.message,true));

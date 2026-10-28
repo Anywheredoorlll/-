@@ -84,3 +84,4 @@ th{font-size:12px}
 #delete-job-form>label,#job-form>label{display:flex;flex-direction:column;gap:6px;color:#65748a;font-size:13px}
 #delete-job-form input,#job-form input{height:38px;padding:0 10px;border:1px solid #dfe6ef;border-radius:7px;outline:0}
 #delete-job-form input:focus,#job-form input:focus{border-color:#79a7f6;box-shadow:0 0 0 3px #edf4ff}
+.source-card{padding:10px;margin:8px 0;border:1px solid var(--line);border-radius:7px}.source-card p{white-space:pre-wrap}.source-page{margin:4px}.review-answer{white-space:pre-wrap;line-height:1.7}.pdf-image-wrap{position:relative;display:inline-block;max-width:100%}.pdf-image-wrap img{display:block;max-width:100%;height:auto}.pdf-highlight{position:absolute;border:2px solid #e85539;background:rgba(232,85,57,.18);pointer-events:none}

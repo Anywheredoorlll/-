@@ -6,7 +6,7 @@ import zipfile
 import pytest
 
 from aviation_ft import core, generation
-from test_core import sample_job
+from test_core import sample_job, verify_all_sources
 
 
 def configured_job(sample_job, monkeypatch):
@@ -27,6 +27,7 @@ def configured_job(sample_job, monkeypatch):
     pages = core.pages_for(sample_job)
     units = [core.add_evidence(sample_job, page["blocks"][0]["block_id"], f"topic-{n}", f"group-{n}", split)
              for n, (page, split) in enumerate(zip(pages, ("train", "validation", "test")))]
+    verify_all_sources(sample_job)
     core.freeze_splits(sample_job)
     return sample_job, units
 
@@ -41,7 +42,11 @@ def test_generated_candidate_is_pending_and_idempotent(sample_job, monkeypatch):
             return {"data": [{"id": "test-served"}]}
         return {"choices": [{"message": {"content": json.dumps({
             "question": "What value applies?", "answerability": "answerable",
-            "answer": "The value is 10. [E1]", "claim": "The value is 10."
+            "answer": "Civil aviation requirement. [E1]", "claims": [{
+                "claim_id": "C1", "text": "Civil aviation requirement",
+                "answer_quote": "Civil aviation requirement", "evidence_ids": ["E1"],
+                "supporting_quotes": [{"evidence_id": "E1", "quote": "Civil aviation requirement"}]
+            }]
         })}}]}
 
     monkeypatch.setattr(generation, "_request", fake_request)
@@ -110,8 +115,12 @@ def test_batch_generation_resumes_and_test_requires_frozen_recipe(sample_job, mo
         return {"choices": [{"message": {"content": json.dumps({
             "question": f"Question {generated}?",
             "answerability": "unanswerable" if is_unanswerable else "answerable",
-            "answer": "证据不足，无法确认。" if is_unanswerable else "The value is 10. [E1]",
-            "claim": "" if is_unanswerable else "The value is 10.",
+            "answer": "证据不足，无法确认。" if is_unanswerable else "Civil aviation requirement. [E1]",
+            "claims": [] if is_unanswerable else [{
+                "claim_id": "C1", "text": "Civil aviation requirement",
+                "answer_quote": "Civil aviation requirement", "evidence_ids": ["E1"],
+                "supporting_quotes": [{"evidence_id": "E1", "quote": "Civil aviation requirement"}]
+            }],
         })}}]}
 
     monkeypatch.setattr(generation, "_request", fake_request)
