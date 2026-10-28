@@ -9,7 +9,7 @@ from aviation_ft import core
 def task_progress(job_id: str) -> dict:
     meta = core.load_job(job_id)
     job_path = core.job_dir(job_id)
-    evidence = core.evidence_for(job_id)
+    evidence = core.active_evidence_for(job_id)
     candidates = core.candidates_for(job_id)
     report = core.read_json(job_path / "parsed/report.json")
     split_frozen = bool(core.read_json(job_path / "evidence/splits.json"))
@@ -18,7 +18,8 @@ def task_progress(job_id: str) -> dict:
     evidence_by_document = {doc["filename"]: sum(e["doc_id"] == doc["doc_id"] for e in evidence) for doc in meta["documents"]}
     candidates_by_split = {split: sum(r["split"] == split for r in candidates) for split in sorted(core.SPLITS)}
     review_counts = dict(Counter(r["review"]["status"] for r in candidates))
-    approved = review_counts.get("approved", 0) + review_counts.get("approved_after_edit", 0)
+    unit_map = {u["evidence_unit_id"]: u for u in core.evidence_for(job_id)}
+    approved = sum(r["review"]["status"] in {"approved", "approved_after_edit"} and not core.validate_candidate(r, unit_map) for r in candidates)
     model_development = sum(r["origin"] == "model" and r["split"] in {"train", "validation"} for r in candidates)
     development_sample = min(20, max(1, evidence_by_split["train"] + evidence_by_split["validation"]))
     if not meta["documents"]:

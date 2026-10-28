@@ -58,14 +58,11 @@ async def dashboard(request: Request) -> JSONResponse:
         "provider": providers.public_config(job_id),
         "provider_presets": providers.provider_presets(),
         "exports": {
-            kind: {"ready": path.is_file(), "size_bytes": path.stat().st_size if path.is_file() else 0}
+            kind: core.sources.artifact_status(job_id, path, core.read_json(path.with_suffix(".sha256.json"), {}))
             for kind in ("preview", "final", "preview-trace", "final-trace")
             for path in [core.job_dir(job_id) / "exports" / f"aviation-sft-{kind}.zip"]
         },
-        "semantic_txt": {
-            "ready": txt_path.is_file(),
-            "size_bytes": txt_path.stat().st_size if txt_path.is_file() else 0,
-        },
+        "semantic_txt": core.sources.artifact_status(job_id, txt_path, core.read_json(txt_path.parent / "txt_report.json", {})),
     })
 
 
@@ -166,25 +163,28 @@ async def page_detail(request: Request) -> JSONResponse:
         page_no = int(request.query_params.get("page", "0"))
     except ValueError as exc:
         raise ValueError("页码无效") from exc
-    pages = core.pages_for(job_id)
-    matches = [
-        page for page in pages
-        if page["doc_id"] == doc_id and page["pdf_page"] == page_no
-    ]
-    if len(matches) != 1:
-        raise ValueError("文档页面不存在")
-    result = dict(matches[0])
-    previous_page = next((
-        page for page in pages
-        if page["doc_id"] == doc_id and page["pdf_page"] == page_no - 1
-    ), None)
-    result["semantic_blocks"] = [
-        unit for unit in core.semantic_blocks_for_document([
-            page for page in pages if page["doc_id"] == doc_id
-        ])
-        if unit["pdf_page"] <= page_no <= unit["end_pdf_page"]
-    ]
-    return response(result)
+    with core.sources.task_lock(job_id):
+        pages = core.pages_for(job_id)
+        matches = [
+            page for page in pages
+            if page["doc_id"] == doc_id and page["pdf_page"] == page_no
+        ]
+        if len(matches) != 1:
+            raise ValueError("文档页面不存在")
+        result = dict(matches[0])
+        previous_page = next((
+            page for page in pages
+            if page["doc_id"] == doc_id and page["pdf_page"] == page_no - 1
+        ), None)
+        result["semantic_blocks"] = [
+            unit for unit in core.semantic_blocks_for_document([
+                page for page in pages if page["doc_id"] == doc_id
+            ])
+            if unit["pdf_page"] <= page_no <= unit["end_pdf_page"]
+        ]
+        result["source_snapshot"] = core.sources.snapshot(job_id)
+        return response(result)
+
 
 
 async def source_pdf(request: Request) -> FileResponse:
@@ -291,6 +291,7 @@ async def download_export(request: Request) -> FileResponse:
     path = core.job_dir(job_id) / "exports" / f"aviation-sft-{kind}.zip"
     if not path.is_file():
         raise ValueError("数据包尚未生成")
+    core.sources.require_artifact(job_id, path, core.read_json(path.with_suffix(".sha256.json"), {}))
     return FileResponse(path, media_type="application/zip", filename=path.name)
 
 async def semantic_txt(request: Request):
@@ -300,6 +301,7 @@ async def semantic_txt(request: Request):
         return response(await run_in_threadpool(core.build_semantic_txt, job_id))
     if not path.is_file():
         raise ValueError("整体 TXT 尚未生成")
+    core.sources.require_artifact(job_id, path, core.read_json(path.parent / "txt_report.json", {}))
     return FileResponse(
         path, media_type="text/plain; charset=utf-8",
         filename=f"{job_id}-semantic-corpus.txt",
@@ -328,6 +330,40 @@ async def cleanup(request: Request) -> JSONResponse:
     return response({"ok": True})
 
 
+
+async def page_source(request: Request) -> JSONResponse:
+    job_id = request.path_params["job_id"]
+    if request.method == "GET":
+        try:
+            page = int(request.query_params.get("page", "0"))
+        except ValueError as exc:
+            raise core.sources.SourceError("页码无效") from exc
+        result = await run_in_threadpool(core.sources.get_page_source_comparison, job_id, request.query_params.get("doc_id", ""), page)
+    else:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise core.sources.SourceError("请求必须是 JSON 对象")
+        action = request.path_params["action"]
+        if action == "preview":
+            result = await run_in_threadpool(core.sources.preview_source_change, job_id, payload)
+        else:
+            operation = {"select": "select_source", "correct": "correct_text", "initialize": "initialize", "verify": "verify"}.get(action)
+            if operation is None:
+                raise core.sources.SourceError("操作不存在", 404)
+            result = await run_in_threadpool(core.sources.commit, job_id, payload, operation)
+    return response(result)
+
+
+async def clone_task(request: Request) -> JSONResponse:
+    payload = await request.json()
+    new_id = await run_in_threadpool(core.clone_parsed_job, request.path_params["job_id"], str(payload.get("label", "")))
+    return response({"job_id": new_id}, 201)
+
+
+async def source_error(_: Request, exc: core.sources.SourceError) -> JSONResponse:
+    return response({"error": str(exc)}, exc.status_code)
+
+
 async def value_error(_: Request, exc: ValueError) -> JSONResponse:
     return response({"error": str(exc)}, 400)
 
@@ -353,6 +389,9 @@ routes = [
     Route("/api/jobs/{job_id}/evidence/suggestions", evidence_suggestions, methods=["GET"]),
     Route("/api/jobs/{job_id}/evidence/batch", add_evidence_batch, methods=["POST"]),
     Route("/api/jobs/{job_id}/evidence/freeze", freeze_evidence, methods=["POST"]),
+    Route("/api/jobs/{job_id}/page-source", page_source, methods=["GET"]),
+    Route("/api/jobs/{job_id}/page-source/{action}", page_source, methods=["POST"]),
+    Route("/api/jobs/{job_id}/clone", clone_task, methods=["POST"]),
     Route("/api/jobs/{job_id}/page", page_detail, methods=["GET"]),
     Route("/api/jobs/{job_id}/pdf/{doc_id}", source_pdf, methods=["GET"]),
     Route("/api/jobs/{job_id}/candidates", candidates, methods=["GET"]),
@@ -366,7 +405,7 @@ routes = [
 app = Starlette(
     debug=False,
     routes=routes,
-    exception_handlers={ValueError: value_error, Exception: unexpected_error},
+    exception_handlers={core.sources.SourceError: source_error, ValueError: value_error, Exception: unexpected_error},
 )
 
 

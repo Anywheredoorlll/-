@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pymupdf as fitz
 
+from aviation_ft import source_revision as sources
+
 ROOT = Path(__file__).resolve().parents[2]
 JOB_RE = re.compile(r"^[0-9a-f]{32}$")
 SPLITS = {"train", "validation", "test"}
@@ -134,6 +136,7 @@ def list_jobs() -> list[dict]:
     return sorted(result, key=lambda x: x["created_at"], reverse=True)
 
 
+@sources.locked
 def clone_parsed_job(job_id: str, label: str = "") -> str:
     """Start a new evidence version from verified PDF files and parsed pages."""
     source = job_dir(job_id)
@@ -152,6 +155,20 @@ def clone_parsed_job(job_id: str, label: str = "") -> str:
             shutil.copy2(source / "raw_pdf" / document["filename"], target / "raw_pdf" / document["filename"])
         for name in parsed_files:
             shutil.copy2(source / "parsed" / name, target / "parsed" / name)
+        if (source / "parsed/sources").is_dir():
+            shutil.copytree(source / "parsed/sources", target / "parsed/sources")
+            state = sources.manifest(new_id)
+            state.setdefault("inherited_operations", []).append(state["operations"])
+            state["operations"] = {}
+            for page_entry in state["pages"].values():
+                for candidate_entry in page_entry["candidates"].values():
+                    if candidate_entry["status"] == "available":
+                        path = target / "parsed/sources/candidates" / f"{candidate_entry['candidate_id']}.json"
+                        candidate = read_json(path)
+                        candidate["job_id"] = new_id
+                        write_json(path, candidate)
+                        candidate_entry["sha256"] = sha256_file(path)
+            write_json(target / "parsed/sources/manifest.json", state)
         clone = load_job(new_id)
         clone["documents"] = [dict(document) for document in meta["documents"]]
         clone["source_job_id"] = job_id
@@ -512,6 +529,8 @@ def parse_job(job_id: str) -> dict:
     meta = load_job(job_id)
     if not meta["documents"]:
         raise ValueError("请先上传 PDF")
+    if (p / "parsed/pages.jsonl").exists():
+        raise ValueError("已有原始提取结果，不能覆盖解析；请创建新任务或建立历史来源基线")
     pages = []
     cfg = settings()
     ocr_languages = cfg.get("ocr_languages", "chi_sim+eng")
@@ -540,6 +559,8 @@ def parse_job(job_id: str) -> dict:
                     return result
 
                 blocks = extract_blocks()
+                native_blocks = [dict(b) for b in blocks]
+                extraction = {"native": {"status": "available", "blocks": native_blocks}, "ocr": {"status": "not_generated"}}
                 text_len = sum(len(b["text"].strip()) for b in blocks)
                 ocr_used = text_len < 30 and bool(page.get_image_info())
                 if ocr_used:
@@ -555,11 +576,10 @@ def parse_job(job_id: str) -> dict:
                             )
                         }
                         blocks = extract_blocks(textpage=textpage, ocr_block_numbers=ocr_block_numbers)
-                    except Exception as exc:
-                        raise ValueError(
-                            f"OCR 失败：{entry['filename']} 第 {idx + 1} 页。"
-                            f"请检查 ocr_tessdata 目录中是否有 {ocr_languages} 的语言包；原因：{exc}"
-                        ) from exc
+                        extraction["ocr"] = {"status": "available", "blocks": blocks}
+                    except (RuntimeError, ValueError, fitz.mupdf.FzErrorLibrary) as exc:
+                        extraction["ocr"] = {"status": "failed", "error": str(exc)}
+                        blocks = native_blocks
                     text_len = sum(len(b["text"].strip()) for b in blocks)
                 scanned = text_len < 30
                 parsed_page = {
@@ -568,6 +588,7 @@ def parse_job(job_id: str) -> dict:
                     "width": round(float(page.rect.width), 2),
                     "height": round(float(page.rect.height), 2),
                     "blocks": blocks, "ocr_used": ocr_used, "possible_scanned": scanned,
+                    "_source_candidates": extraction,
                 }
                 parsed_page["semantic_blocks"] = semantic_blocks_for_page(parsed_page, previous_page)
                 pages.append(parsed_page)
@@ -577,7 +598,11 @@ def parse_job(job_id: str) -> dict:
                 counts["ocr_pages"] += int(ocr_used)
                 counts["ocr_blocks"] += sum(b["ocr_used"] for b in blocks)
                 counts["possible_scanned_pages"] += int(scanned)
-    write_jsonl(p / "parsed/pages.jsonl", pages)
+    with sources.task_lock(job_id):
+        if (p / "evidence/units.jsonl").exists() or sources.manifest(job_id)["pages"]:
+            raise ValueError("解析期间任务已变化，拒绝覆盖")
+        write_jsonl(p / "parsed/pages.jsonl", [{k: v for k, v in page.items() if k != "_source_candidates"} for page in pages])
+        sources.register_parsed(job_id, pages)
     txt_report = build_semantic_txt(job_id)
     counts["semantic_units"] = txt_report["semantic_units"]
     counts["semantic_txt_chars"] = txt_report["chars"]
@@ -588,34 +613,50 @@ def parse_job(job_id: str) -> dict:
 
 
 def pages_for(job_id: str) -> list[dict]:
-    return read_jsonl(job_dir(job_id) / "parsed/pages.jsonl")
+    return sources.effective_pages(job_id, read_jsonl(job_dir(job_id) / "parsed/pages.jsonl"))
 
 
 def evidence_for(job_id: str) -> list[dict]:
-    return read_jsonl(job_dir(job_id) / "evidence/units.jsonl")
+    return sources.annotate_evidence(job_id, read_jsonl(job_dir(job_id) / "evidence/units.jsonl"))
+
+
+def active_evidence_for(job_id: str) -> list[dict]:
+    return [u for u in evidence_for(job_id) if not u["source_issues"]]
 
 def build_semantic_txt(job_id: str) -> dict:
     """Build an ordered, readable evidence-block corpus from every parsed PDF."""
     from aviation_ft import readable_txt
     p = job_dir(job_id)
+    with sources.task_lock(job_id):
+        expected_snapshot = sources.snapshot(job_id)
     content, records, exclusions, report = readable_txt.build(job_id)
-    target = p / "parsed/semantic_corpus.txt"
-    fd, tmp = tempfile.mkstemp(prefix=".semantic-", dir=target.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(content)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(tmp, target)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-    report["sha256"] = sha256_file(target)
-    write_jsonl(p / "parsed/readable_units.jsonl", records)
-    write_json(p / "parsed/txt_report.json", {**report, "exclusions": exclusions})
-    return report
+    with sources.task_lock(job_id):
+        if sources.snapshot(job_id) != expected_snapshot:
+            raise sources.SourceError("TXT 生成期间来源已变化，请重新生成", 409)
+        target = p / "parsed/semantic_corpus.txt"
+        history = sources.archive_artifact(target)
+        if history:
+            for name in ("txt_report.json", "readable_units.jsonl"):
+                if (target.parent / name).is_file():
+                    shutil.copy2(target.parent / name, history / name)
+        report["source_snapshot"] = expected_snapshot
+        fd, tmp = tempfile.mkstemp(prefix=".semantic-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(content)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        report["sha256"] = sha256_file(target)
+        write_jsonl(p / "parsed/readable_units.jsonl", records)
+        write_json(p / "parsed/txt_report.json", {**report, "exclusions": exclusions})
+        return report
 
 
+@sources.locked
 def add_evidence(job_id: str, block_id: str, topic: str, clause_group: str, split: str, quote: str | None = None) -> dict:
     p = job_dir(job_id)
     if (p / "evidence/splits.json").exists():
@@ -629,14 +670,15 @@ def add_evidence(job_id: str, block_id: str, topic: str, clause_group: str, spli
     text = block["text"]
     quote = (quote or text).strip()
     start = text.find(quote)
-    if start < 0:
-        raise ValueError("引用必须是原始 block 的精确子串")
+    if start < 0 or text.find(quote, start + 1) >= 0:
+        raise ValueError("引用必须是原始 block 中唯一的精确子串")
     records = evidence_for(job_id)
-    if any(r["block_id"] == block_id and r["quote"] == quote for r in records):
+    if any(r["block_id"] == block_id and r["quote"] == quote and not any("已过期" in issue for issue in r["source_issues"]) for r in records):
         raise ValueError("证据单元重复")
     record = {"evidence_unit_id": f"EU-{uuid.uuid4().hex[:12]}", "doc_id": page["doc_id"], "filename": page["filename"], "pdf_page": page["pdf_page"], "printed_page": page["printed_page"], "block_id": block_id, "bbox": block["bbox"], "source_text": text, "quote": quote, "char_start": start, "char_end": start + len(quote), "topic": topic.strip(), "clause_group": clause_group.strip(), "split": split, "confirmed_at": now()}
+    sources.bind_evidence(job_id, record)
     records.append(record)
-    write_jsonl(p / "evidence/units.jsonl", records)
+    write_jsonl(p / "evidence/units.jsonl", [{k: v for k, v in u.items() if k != "source_issues"} for u in records])
     return record
 
 
@@ -672,6 +714,7 @@ def page_block_range(page: dict, start_block_id: str, end_block_id: str) -> dict
     }
 
 
+@sources.locked
 def add_evidence_range(
     job_id: str, doc_id: str, pdf_page: int, start_block_id: str,
     end_block_id: str, topic: str, clause_group: str, split: str,
@@ -693,10 +736,10 @@ def add_evidence_range(
     text = source["source_text"]
     quote = (quote or text).strip()
     start = text.find(quote)
-    if start < 0:
-        raise ValueError("引用必须是所选连续文本块的精确子串")
+    if start < 0 or text.find(quote, start + 1) >= 0:
+        raise ValueError("引用必须是所选连续文本块中唯一的精确子串")
     records = evidence_for(job_id)
-    if any(r["block_id"] == source["block_id"] and r["quote"] == quote for r in records):
+    if any(r["block_id"] == source["block_id"] and r["quote"] == quote and not any("已过期" in issue for issue in r["source_issues"]) for r in records):
         raise ValueError("证据单元重复")
     if any(
         r["doc_id"] == doc_id and r["clause_group"] == clause_group.strip() and r["split"] != split
@@ -717,8 +760,9 @@ def add_evidence_range(
         "split": split, "scope": "block_range", "ocr_used": source["ocr_used"],
         "confirmed_by": reviewer.strip(), "confirmed_at": now(),
     }
+    sources.bind_evidence(job_id, record)
     records.append(record)
-    write_jsonl(p / "evidence/units.jsonl", records)
+    write_jsonl(p / "evidence/units.jsonl", [{k: v for k, v in u.items() if k != "source_issues"} for u in records])
     return record
 
 
@@ -787,7 +831,7 @@ def evidence_suggestions(job_id: str, doc_id: str, limit: int = 20) -> list[dict
         raise ValueError("文档不存在或尚未解析")
     existing_sources = {
         (item["doc_id"], tuple(item.get("block_ids") or [item["block_id"]]))
-        for item in evidence_for(job_id)
+        for item in active_evidence_for(job_id)
     }
     page_lookup = {page["pdf_page"]: page for page in document_pages}
     all_candidates = []
@@ -812,6 +856,7 @@ def evidence_suggestions(job_id: str, doc_id: str, limit: int = 20) -> list[dict
     for page, source in candidates:
         band = (page["pdf_page"] - 1) // 5
         result.append({
+            "source_snapshot": sources.snapshot(job_id),
             "selected": False,
             "pdf_page": page["pdf_page"],
             "end_pdf_page": source["end_pdf_page"],
@@ -834,6 +879,7 @@ def evidence_suggestions(job_id: str, doc_id: str, limit: int = 20) -> list[dict
     return result
 
 
+@sources.locked
 def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[dict]:
     """Validate a batch in memory and write it atomically."""
     p = job_dir(job_id)
@@ -849,10 +895,12 @@ def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[di
         for block in page["blocks"]
     }
     records = evidence_for(job_id)
-    seen_quotes = {(r["block_id"], r["quote"]) for r in records}
+    seen_quotes = {(r["block_id"], r["quote"]) for r in records if not any("已过期" in issue for issue in r["source_issues"])}
     group_splits = {(r["doc_id"], r["clause_group"]): r["split"] for r in records}
     additions = []
     for item in items:
+        if "source_snapshot" in item and item["source_snapshot"] != sources.snapshot(job_id):
+            raise sources.SourceError("证据预览来源已变化，请重新核对", 409)
         block_id = item.get("block_id")
         start_id = item.get("start_block_id") or block_id
         end_id = item.get("end_block_id") or block_id
@@ -901,8 +949,8 @@ def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[di
         quote = str(item.get("quote", "")).strip()
         text = source["source_text"]
         start = text.find(quote) if quote else -1
-        if start < 0:
-            raise ValueError(f"{block_id}：引用必须是该文本块的精确子串")
+        if start < 0 or text.find(quote, start + 1) >= 0:
+            raise ValueError(f"{block_id}：引用必须是该文本块中唯一的精确子串")
         key = (block_id, quote)
         if key in seen_quotes:
             raise ValueError(f"{block_id}：证据单元重复")
@@ -932,15 +980,20 @@ def add_evidence_batch(job_id: str, items: list[dict], reviewer: str) -> list[di
             "confirmed_by": reviewer.strip(), "confirmed_at": now(),
             "confirmation_mode": "automated" if reviewer.startswith("model:") else "human",
         })
-    write_jsonl(p / "evidence/units.jsonl", records + additions)
+    for unit in additions:
+        sources.bind_evidence(job_id, unit)
+    write_jsonl(p / "evidence/units.jsonl", [{k: v for k, v in u.items() if k != "source_issues"} for u in records + additions])
     return additions
 
 
+@sources.locked
 def freeze_splits(job_id: str) -> dict:
     p = job_dir(job_id)
     if (p / "evidence/splits.json").exists():
         return read_json(p / "evidence/splits.json")
-    evidence = evidence_for(job_id)
+    evidence = active_evidence_for(job_id)
+    if any(u["source_issues"] and "当前来源版本待人工核实" in u["source_issues"] for u in evidence_for(job_id)):
+        raise sources.SourceError("来源版本待核实，不能冻结", 409)
     if not evidence or {e["split"] for e in evidence} != SPLITS:
         raise ValueError("冻结前 train、validation、test 都必须有证据")
     groups = {}
@@ -959,6 +1012,7 @@ def candidates_for(job_id: str) -> list[dict]:
     return read_jsonl(job_dir(job_id) / "candidates/records.jsonl")
 
 
+@sources.locked
 def add_candidate(job_id: str, question: str, answer: str, evidence_ids: list[str], answerability: str, claim: str = "", origin: str = "manual", generator_model: str | None = None, prompt_version: str | None = None, generation_key: str | None = None) -> dict:
     p = job_dir(job_id)
     if not (p / "evidence/splits.json").exists():
@@ -966,6 +1020,7 @@ def add_candidate(job_id: str, question: str, answer: str, evidence_ids: list[st
     units = {e["evidence_unit_id"]: e for e in evidence_for(job_id)}
     if not evidence_ids or any(eid not in units for eid in evidence_ids):
         raise ValueError("至少选择一个存在的证据单元")
+    sources.require_evidence(job_id, [units[eid] for eid in evidence_ids])
     splits = {units[eid]["split"] for eid in evidence_ids}
     if len(splits) != 1:
         raise ValueError("不能跨 split 组合证据")
@@ -974,7 +1029,7 @@ def add_candidate(job_id: str, question: str, answer: str, evidence_ids: list[st
     refs = []
     for idx, eid in enumerate(evidence_ids, 1):
         e = units[eid]
-        refs.append({"evidence_id": f"E{idx}", "evidence_unit_id": eid, "doc_id": e["doc_id"], "pdf_page": e["pdf_page"], "block_id": e["block_id"], "quote": e["quote"], "char_start": e["char_start"], "char_end": e["char_end"]})
+        refs.append({"evidence_id": f"E{idx}", "evidence_unit_id": eid, "doc_id": e["doc_id"], "pdf_page": e["pdf_page"], "block_id": e["block_id"], "quote": e["quote"], "char_start": e["char_start"], "char_end": e["char_end"], "source_revisions": e.get("source_revisions", {})})
     records = candidates_for(job_id)
     if generation_key and any(r.get("generation_key") == generation_key for r in records):
         raise ValueError("同一证据、提示词和变体的候选已存在")
@@ -1001,9 +1056,12 @@ def validate_candidate(record: dict, units: dict[str, dict]) -> list[str]:
         if not unit:
             errors.append("引用的证据单元不存在")
             continue
+        errors.extend(unit.get("source_issues", []))
         if rid in seen:
             errors.append("证据编号重复")
         seen.add(rid)
+        if ref.get("source_revisions", {}) != unit.get("source_revisions", {}):
+            errors.append("引用来源版本与证据不一致")
         for field in ("doc_id", "pdf_page", "block_id"):
             if ref.get(field) != unit[field]:
                 errors.append(f"引用 {field} 与原文不一致")
@@ -1036,6 +1094,7 @@ def validate_candidate(record: dict, units: dict[str, dict]) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+@sources.locked
 def edit_candidate(job_id: str, sample_id: str, revised: dict, editor: str) -> dict:
     if not editor.strip() or revised.get("sample_id") != sample_id:
         raise ValueError("编辑人不能为空，且样本 ID 不可修改")
@@ -1061,6 +1120,7 @@ def edit_candidate(job_id: str, sample_id: str, revised: dict, editor: str) -> d
     return revised
 
 
+@sources.locked
 def review_candidate(job_id: str, sample_id: str, decision: str, reviewer: str, comment: str = "", auto_assessment: dict | None = None) -> dict:
     if decision not in DECISIONS or not reviewer.strip():
         raise ValueError("请选择审核结论并填写审核人")
@@ -1087,6 +1147,7 @@ def review_candidate(job_id: str, sample_id: str, decision: str, reviewer: str, 
     return record
 
 
+@sources.locked
 def review_candidates_batch(
     job_id: str, sample_ids: list[str], reviewer: str,
     decision: str = "approved", comment: str = "",
@@ -1131,9 +1192,10 @@ def review_candidates_batch(
 
 def quality_report(job_id: str) -> dict:
     meta = load_job(job_id)
-    evidence = evidence_for(job_id)
+    evidence = active_evidence_for(job_id)
     records = candidates_for(job_id)
-    approved = [r for r in records if r["review"]["status"] in {"approved", "approved_after_edit"}]
+    unit_map = {u["evidence_unit_id"]: u for u in evidence_for(job_id)}
+    approved = [r for r in records if r["review"]["status"] in {"approved", "approved_after_edit"} and not validate_candidate(r, unit_map)]
     document_count = len(meta["documents"])
     evidence_target = 20 * document_count
     approved_target = 90 * document_count
@@ -1234,6 +1296,8 @@ def _jsonl_bytes(records: list[dict]) -> bytes:
 
 def export_job(job_id: str, final: bool = False, *, include_audit: bool = False) -> tuple[Path, str, dict]:
     p = job_dir(job_id)
+    with sources.task_lock(job_id):
+        expected_inputs = sources.build_fingerprint(job_id)
     report = quality_report(job_id)
     if final and not report["final_ready"]:
         raise ValueError("正式导出门槛未达成：" + "；".join(report["issues"][:5]))
@@ -1250,7 +1314,8 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
             path = p / "raw_pdf" / document["filename"]
             if not path.exists() or sha256_file(path) != document["sha256"]:
                 raise ValueError(f"原始 PDF 缺失或哈希变化：{document['filename']}")
-    approved = [r for r in candidates_for(job_id) if r["review"]["status"] in {"approved", "approved_after_edit"}]
+    units = {u["evidence_unit_id"]: u for u in evidence_for(job_id)}
+    approved = [r for r in candidates_for(job_id) if r["review"]["status"] in {"approved", "approved_after_edit"} and not validate_candidate(r, units)]
     def training_record(r):
         prompt = "\n".join(f"[{ref['evidence_id']}] {ref['quote']}" for ref in r["evidence"])
         return {"messages": [{"role": "system", "content": "只能依据给定证据回答；每个关键结论须引用证据编号；证据不足须说明边界。"}, {"role": "user", "content": f"证据：\n{prompt}\n\n问题：{r['question']}"}, {"role": "assistant", "content": r["answer"]}], "metadata": {"sample_id": r["sample_id"], "evidence_unit_ids": [x["evidence_unit_id"] for x in r["evidence"]], "answerability": r["answerability"], "origin": r["origin"]}}
@@ -1271,72 +1336,83 @@ def export_job(job_id: str, final: bool = False, *, include_audit: bool = False)
         "整理后的 TXT 单独下载；两个包中的训练、验证、测试数据完全一致。\n\n"
         + card["note"] + "\n"
     ).encode("utf-8")
+    contents = {f"{split}.jsonl": _jsonl_bytes([training_record(r) for r in approved if r["split"] == split]) for split in sorted(SPLITS)}
+    training_contents = {**contents, "README.txt": readme}
+    contents["README.txt"] = readme
+    contents["master_approved.jsonl"] = _jsonl_bytes(approved)
+    contents["evidence_units.jsonl"] = _jsonl_bytes(evidence_for(job_id))
+    contents["review_events.jsonl"] = (p / "reviewed/events.jsonl").read_bytes() if (p / "reviewed/events.jsonl").exists() else b""
+    contents["generation_attempts.jsonl"] = (p / "candidates/generation_attempts.jsonl").read_bytes() if (p / "candidates/generation_attempts.jsonl").exists() else b""
+    for archive_name, relative_path in (
+        ("evidence_auto_assessments.jsonl", "evidence/auto_assessments.jsonl"),
+        ("evidence_human_queue.jsonl", "evidence/human_queue.jsonl"),
+        ("automation_progress.jsonl", "automation/progress.jsonl"),
+    ):
+        source = p / relative_path
+        if source.exists():
+            contents[archive_name] = source.read_bytes()
+    judge_prompt = ROOT / "prompts/judge_grounded_qa.md"
+    if judge_prompt.is_file():
+        contents["judge_prompt.md"] = judge_prompt.read_bytes()
+    frozen_recipe_path = p / "candidates/generation_recipe.json"
+    if frozen_recipe_path.exists():
+        contents["generation_recipe.json"] = frozen_recipe_path.read_bytes()
+    generation_config = ROOT / "configs/generation.json"
+    if generation_config.exists():
+        contents["generation_config.json"] = generation_config.read_bytes()
+        prompt_file = read_json(generation_config).get("prompt_file")
+        if prompt_file and (ROOT / prompt_file).is_file():
+            contents["generation_prompt.md"] = (ROOT / prompt_file).read_bytes()
+    if (p / "parsed/sources/manifest.json").is_file():
+        source_state = sources.manifest(job_id)
+        contents["source_history/manifest.json"] = (p / "parsed/sources/manifest.json").read_bytes()
+        source_paths = {f"revisions/{rid}.json" for rid in source_state["revisions"]}
+        source_paths.update(f"candidates/{entry['candidate_id']}.json" for page in source_state["pages"].values()
+                            for entry in page["candidates"].values() if entry["status"] == "available")
+        for relative in sorted(source_paths):
+            contents["source_history/" + relative] = (p / "parsed/sources" / relative).read_bytes()
+    contents["dataset_card.json"] = json.dumps(card, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    contents["sources.json"] = json.dumps(card["documents"], ensure_ascii=False, indent=2).encode("utf-8")
+    checksums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(contents.items()))
+    contents["SHA256SUMS.txt"] = checksums.encode()
     fd, tmp = tempfile.mkstemp(prefix=".export-", dir=target.parent)
     os.close(fd)
+    trace_fd, trace_tmp = tempfile.mkstemp(prefix=".export-trace-", dir=target.parent)
+    os.close(trace_fd)
     try:
-        contents = {f"{split}.jsonl": _jsonl_bytes([training_record(r) for r in approved if r["split"] == split]) for split in sorted(SPLITS)}
-        training_contents = {**contents, "README.txt": readme}
-        contents["README.txt"] = readme
-        contents["master_approved.jsonl"] = _jsonl_bytes(approved)
-        contents["evidence_units.jsonl"] = _jsonl_bytes(evidence_for(job_id))
-        contents["review_events.jsonl"] = (p / "reviewed/events.jsonl").read_bytes() if (p / "reviewed/events.jsonl").exists() else b""
-        contents["generation_attempts.jsonl"] = (p / "candidates/generation_attempts.jsonl").read_bytes() if (p / "candidates/generation_attempts.jsonl").exists() else b""
-        for archive_name, relative_path in (
-            ("evidence_auto_assessments.jsonl", "evidence/auto_assessments.jsonl"),
-            ("evidence_human_queue.jsonl", "evidence/human_queue.jsonl"),
-            ("automation_progress.jsonl", "automation/progress.jsonl"),
-        ):
-            source = p / relative_path
-            if source.exists():
-                contents[archive_name] = source.read_bytes()
-        judge_prompt = ROOT / "prompts/judge_grounded_qa.md"
-        if judge_prompt.is_file():
-            contents["judge_prompt.md"] = judge_prompt.read_bytes()
-        frozen_recipe_path = p / "candidates/generation_recipe.json"
-        if frozen_recipe_path.exists():
-            contents["generation_recipe.json"] = frozen_recipe_path.read_bytes()
-        generation_config = ROOT / "configs/generation.json"
-        if generation_config.exists():
-            contents["generation_config.json"] = generation_config.read_bytes()
-            prompt_file = read_json(generation_config).get("prompt_file")
-            if prompt_file and (ROOT / prompt_file).is_file():
-                contents["generation_prompt.md"] = (ROOT / prompt_file).read_bytes()
-        contents["dataset_card.json"] = json.dumps(card, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
-        contents["sources.json"] = json.dumps(card["documents"], ensure_ascii=False, indent=2).encode("utf-8")
-        checksums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(contents.items()))
-        contents["SHA256SUMS.txt"] = checksums.encode()
-        trace_fd, trace_tmp = tempfile.mkstemp(prefix=".export-trace-", dir=target.parent)
-        os.close(trace_fd)
-        try:
-            with zipfile.ZipFile(trace_tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for name, data in sorted(contents.items()):
-                    archive.writestr(name, data)
-            os.replace(trace_tmp, trace_target)
-        finally:
-            if os.path.exists(trace_tmp):
-                os.unlink(trace_tmp)
-        contents = training_contents
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        with zipfile.ZipFile(trace_tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, data in sorted(contents.items()):
-                z.writestr(name, data)
-        os.replace(tmp, target)
+                archive.writestr(name, data)
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, data in sorted(training_contents.items()):
+                archive.writestr(name, data)
+        with sources.task_lock(job_id):
+            if sources.build_fingerprint(job_id) != expected_inputs:
+                raise sources.SourceError("导出期间来源、证据或审核已变化，请重新导出", 409)
+            sources.archive_artifact(target)
+            sources.archive_artifact(trace_target)
+            os.replace(trace_tmp, trace_target)
+            os.replace(tmp, target)
+            digests = {}
+            for artifact, bundle in ((target, "training"), (trace_target, "trace")):
+                digest = sha256_file(artifact)
+                digests[bundle] = digest
+                write_json(artifact.with_suffix(".sha256.json"), {
+                    "filename": artifact.name, "sha256": digest, "created_at": now(),
+                    "status": card["status"], "bundle": bundle,
+                    "source_snapshot": expected_inputs["source_snapshot"],
+                    "candidates_sha256": expected_inputs["candidates_sha256"],
+                    "evidence_sha256": expected_inputs["evidence_sha256"],
+                })
+            meta = load_job(job_id)
+            meta["status"] = "final_exported" if final else "preview_exported"
+            meta["last_export_at"] = now()
+            write_json(p / "job.json", meta)
+        return (trace_target, digests["trace"], report) if include_audit else (target, digests["training"], report)
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-    digests = {}
-    for artifact, bundle in ((target, "training"), (trace_target, "trace")):
-        digest = sha256_file(artifact)
-        digests[bundle] = digest
-        write_json(artifact.with_suffix(".sha256.json"), {
-            "filename": artifact.name, "sha256": digest, "created_at": now(),
-            "status": card["status"], "bundle": bundle,
-            "candidates_sha256": sha256_file(p / "candidates/records.jsonl") if (p / "candidates/records.jsonl").exists() else None,
-            "evidence_sha256": sha256_file(p / "evidence/units.jsonl") if (p / "evidence/units.jsonl").exists() else None,
-        })
-    meta["status"] = "final_exported" if final else "preview_exported"
-    meta["last_export_at"] = now()
-    write_json(p / "job.json", meta)
-    return (trace_target, digests["trace"], report) if include_audit else (target, digests["training"], report)
+        for temporary in (tmp, trace_tmp):
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def delete_job(job_id: str, confirmation: str) -> dict:

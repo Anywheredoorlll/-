@@ -102,7 +102,7 @@ class PdfLayout:
 
     def text(self, unit):
         text = unit["text"]
-        if self.pdf:
+        if self.pdf and not unit.get("effective_text_only"):
             for n in range(unit["pdf_page"], unit["end_pdf_page"] + 1):
                 if n not in self.repairs:
                     self.repairs[n] = geometry_text_repairs(self.pdf[n - 1])
@@ -112,7 +112,7 @@ class PdfLayout:
         # Terms occupy a distinct first physical line in this layout. Keep
         # the term, its English label, and its definition visually separate.
         first_line = unit["raw_text"].splitlines()[0]
-        for repairs in self.repairs.values():
+        for repairs in ([] if unit.get("effective_text_only") else self.repairs.values()):
             for original, fixed in sorted(repairs.items(), key=lambda pair: -len(pair[0])):
                 first_line = first_line.replace(original, fixed)
         first_line = normalize(first_line)
@@ -125,6 +125,8 @@ class PdfLayout:
         return text
 
     def render_table(self, unit):
+        if unit.get("effective_text_only"):
+            return self.text(unit), [], ["采用有效来源文字，未重新恢复表格行列；请核对原 PDF"]
         if not self.pdf:
             return self.text(unit), [], ["缺少原始 PDF，未恢复表格行列"]
         title = normalize(unit["text"].splitlines()[0])
@@ -203,7 +205,7 @@ def document_blocks(units, layout):
             current = {"doc_id": u["doc_id"], "clause": clause[1] if clause else "",
                        "section": list(section), "pdf_page": u["pdf_page"],
                        "end_pdf_page": u["end_pdf_page"], "parts": [],
-                       "source_locations": [], "tables": [], "warnings": []}
+                       "source_locations": [], "source_revisions": {}, "tables": [], "warnings": []}
         if u["kind"] == "table":
             text, tables, warnings = layout.render_table(u)
             current["tables"].extend(tables)
@@ -217,6 +219,7 @@ def document_blocks(units, layout):
         # Keep explanations, list items and captions on their own lines.
         current["parts"].append(text)
         current["source_locations"].extend(u["source_locations"])
+        current["source_revisions"].update(u.get("source_revisions", {}))
         current["end_pdf_page"] = max(current["end_pdf_page"], u["end_pdf_page"])
     flush()
     return events, excluded
@@ -227,6 +230,7 @@ def build(job_id):
     pages = core.pages_for(job_id)
     if not pages:
         raise ValueError("请先解析 PDF，再生成整体 TXT")
+    source_snapshot = {core.sources.page_key(p["doc_id"], p["pdf_page"]): p.get("source_revision_id") or "legacy:" + core.sources.digest(p["blocks"]) for p in pages}
     meta = core.load_job(job_id)
     sections, records, exclusions, warnings = [], [], [], []
     merged_cross_page = 0
@@ -253,6 +257,10 @@ def build(job_id):
                     continue
                 document_pages.append(page)
             units = core.semantic_blocks_for_document(document_pages)
+            protected_pages = {p["pdf_page"] for p in document_pages if p.get("source_kind") in {"manual", "ocr"}}
+            for unit in units:
+                unit["effective_text_only"] = any(loc["pdf_page"] in protected_pages for loc in unit["source_locations"])
+                unit["source_revisions"] = {core.sources.page_key(doc["doc_id"], loc["pdf_page"]): source_snapshot[core.sources.page_key(doc["doc_id"], loc["pdf_page"])] for loc in unit["source_locations"]}
             merged_cross_page += sum(len({loc["pdf_page"] for loc in u["source_locations"]}) - 1 for u in units)
             events, excluded = document_blocks(units, PdfLayout(pdf))
             exclusions.extend({"doc_id": doc["doc_id"], "semantic_id": u["semantic_id"],

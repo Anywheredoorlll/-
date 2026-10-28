@@ -139,9 +139,11 @@ def test_parse_scanned_pdf_keeps_native_text_and_ocr_bbox(tmp_path, monkeypatch)
     (tmp_path / "configs/settings.json").write_text(json.dumps(bad_config), encoding="utf-8")
     failing_job = core.create_job()
     core.upload_pdf(failing_job, "mixed.pdf", io.BytesIO(pdf_bytes))
-    with pytest.raises(ValueError, match="OCR 失败：mixed.pdf 第 2 页"):
-        core.parse_job(failing_job)
-    assert not (core.job_dir(failing_job) / "parsed/pages.jsonl").exists()
+    core.parse_job(failing_job)
+    failed = core.sources.get_page_source_comparison(failing_job, core.load_job(failing_job)["documents"][0]["doc_id"], 2)
+    assert failed["candidates"]["ocr"]["status"] == "failed"
+    assert failed["current"]["source_kind"] == "native"
+    assert failed["requires_verification"] and not failed["source_verified"]
 
 
 def test_batch_evidence_is_atomic_and_keeps_exact_sources(sample_job):
@@ -467,6 +469,7 @@ def test_semantic_txt_merges_cross_page_clause_only_in_txt_branch(sample_job):
             "ocr_used": False,
         }],
     }
+    (core.job_dir(sample_job) / "parsed/sources/manifest.json").unlink(missing_ok=True)  # legacy fixture without source revisions
     core.write_jsonl(core.job_dir(sample_job) / "parsed/pages.jsonl", [first, second])
     report = core.build_semantic_txt(sample_job)
     text = (core.job_dir(sample_job) / "parsed/semantic_corpus.txt").read_text(encoding="utf-8")
@@ -600,6 +603,7 @@ def test_semantic_txt_merges_cross_page_tables(sample_job):
              "text": "第二部分检查内容", "ocr_used": False},
         ],
     }
+    (core.job_dir(sample_job) / "parsed/sources/manifest.json").unlink(missing_ok=True)  # legacy fixture without source revisions
     core.write_jsonl(core.job_dir(sample_job) / "parsed/pages.jsonl", [first, second])
 
     report = core.build_semantic_txt(sample_job)

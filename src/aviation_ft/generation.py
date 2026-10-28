@@ -156,6 +156,7 @@ def generate_candidate(job_id: str, evidence_unit_id: str, variant: str = "fact"
     unit = units.get(evidence_unit_id)
     if not unit:
         raise ValueError("证据单元不存在")
+    core.sources.require_evidence(job_id, [unit])
     if unit["split"] == "test":
         frozen_recipe = core.read_json(p / "candidates/generation_recipe.json")
         if not frozen_recipe:

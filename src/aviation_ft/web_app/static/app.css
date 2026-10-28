@@ -84,3 +84,16 @@ th{font-size:12px}
 #delete-job-form>label,#job-form>label{display:flex;flex-direction:column;gap:6px;color:#65748a;font-size:13px}
 #delete-job-form input,#job-form input{height:38px;padding:0 10px;border:1px solid #dfe6ef;border-radius:7px;outline:0}
 #delete-job-form input:focus,#job-form input:focus{border-color:#79a7f6;box-shadow:0 0 0 3px #edf4ff}
+
+.source-panels {max-height:1000px;overflow:auto;min-width:0}
+.source-panels pre {white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f7fb;padding:10px}
+.source-panels details {margin-bottom:12px;border:1px solid #dfe6ef;padding:10px;border-radius:6px}
+.source-diff-columns {display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.source-change {padding:8px;border:1px solid #dfe6ef;margin:8px 0}
+.source-important {border-left:4px solid #c56b16;background:#fff8ed}
+.source-risk {color:#ac4b19}
+.source-page-map {position:relative;border:1px solid #b8c5d6;max-height:300px;margin-top:10px;background:#f5f7fb}
+.source-box {position:absolute;display:none;border:2px solid #d94530;background:#ef766b33}
+.source-panels .stack-label {margin:8px 0}
+.source-panels [hidden] {display:none}
+@media(max-width:760px){.source-diff-columns{grid-template-columns:1fr}}

@@ -90,7 +90,7 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
         return {"status": "frozen", "added": 0, "assessed": 0, "issues": []}
     cfg = _provider_config()
     pages = {(page["doc_id"], page["pdf_page"]): page for page in core.pages_for(job_id)}
-    records = core.evidence_for(job_id)
+    records = core.active_evidence_for(job_id)
     assessments_path = p / "evidence/auto_assessments.jsonl"
     cached = {row["block_id"]: row for row in core.read_jsonl(assessments_path)}
     issue_path = p / "evidence/human_queue.jsonl"
@@ -105,6 +105,8 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
                     break
                 page = pages[(doc["doc_id"], item["pdf_page"])]
                 quality_issues = item.get("quality_issues") or core.evidence_source_issues(item)
+                if page.get("requires_verification") and not page.get("source_verified"):
+                    quality_issues = [*quality_issues, "当前来源版本待人工核实"]
                 if quality_issues:
                     reason = "；".join(quality_issues)
                     _queue_evidence_issue(issue_path, item, reason)
@@ -125,7 +127,7 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
                     continue
                 previous = cached.get(item["block_id"])
                 quote_sha = hashlib.sha256(item["quote"].encode()).hexdigest()
-                if previous and previous["quote_sha256"] == quote_sha:
+                if previous and previous["quote_sha256"] == quote_sha and previous.get("source_snapshot") == item["source_snapshot"]:
                     verdict = previous["verdict"]
                     score = previous["confidence"]
                     supporting = previous["supporting_quote"]
@@ -139,7 +141,7 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
                     except Exception as exc:
                         verdict, score, supporting, reason = "uncertain", 0, "", str(exc)
                     assessed += 1
-                    log = {"at": core.now(), "block_id": item["block_id"], "quote_sha256": quote_sha,
+                    log = {"at": core.now(), "block_id": item["block_id"], "source_snapshot": item["source_snapshot"], "quote_sha256": quote_sha,
                            "verdict": verdict, "confidence": score, "supporting_quote": supporting,
                            "reason": reason, "model_id": cfg["model_id"]}
                     core.append_jsonl(assessments_path, log)
@@ -159,7 +161,7 @@ def prepare_evidence(job_id: str, max_assessments: int = 120) -> dict:
                                "reason": f"证据不足：{counts[split]}/{target}"})
     if issues and any("证据不足" in item["reason"] for item in issues):
         return {"status": "needs_human", "added": added, "assessed": assessed, "issues": issues}
-    all_units = core.evidence_for(job_id)
+    all_units = core.active_evidence_for(job_id)
     by_split = Counter(unit["split"] for unit in all_units)
     document_count = len(core.load_job(job_id)["documents"])
     if (len(all_units) < 20 * document_count or

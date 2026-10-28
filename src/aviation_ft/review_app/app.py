@@ -267,7 +267,10 @@ with t_upload:
             result = action(core.build_semantic_txt, job_id)
             if result:
                 st.rerun()
-        if txt_path.is_file():
+        txt_status = core.sources.artifact_status(job_id, txt_path, core.read_json(txt_path.parent / "txt_report.json", {}))
+        if txt_status["stale"]:
+            st.warning("TXT 来源已过期，请主动重新生成。")
+        if txt_status["ready"]:
             st.download_button(
                 "下载整体 TXT",
                 data=txt_path.read_bytes(),
@@ -839,6 +842,7 @@ with t_export:
             evidence_path = core.job_dir(job_id) / "evidence/units.jsonl"
             stale = sidecar.get("candidates_sha256") != (core.sha256_file(candidate_path) if candidate_path.exists() else None) or sidecar.get("evidence_sha256") != (core.sha256_file(evidence_path) if evidence_path.exists() else None)
             st.write(f"{path.name} · SHA-256 `{digest}`")
+            stale = stale or core.sources.artifact_status(job_id, path, sidecar)["stale"]
             if stale:
                 st.warning("此包生成后候选或证据发生变化，请重新导出。")
             else:
